@@ -84,6 +84,7 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
         self.dev_id = dev_id
         self._attr_unique_id = f"{dev_id}_camera"
         self._snapshot_lock = asyncio.Lock()
+        self._last_image: bytes | None = None
 
     @property
     def is_on(self) -> bool:
@@ -209,11 +210,11 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
             if is_streaming:
                 status_text = "STREAMING (LIVE PREVIEW ACTIVE)"
                 status_color = (0, 230, 118)
-                sub_text = "AWS Kinesis Video Streams WebRTC | Camera Active"
+                sub_text = "AWS Kinesis WebRTC Active | Intercom Camera Ready"
             elif is_ringing:
                 status_text = "INCOMING CALL (RINGING)"
                 status_color = (255, 75, 75)
-                sub_text = "Call Alert | Turn On Camera to View"
+                sub_text = "Call in Progress | Doorbell Active"
             elif status == "ready":
                 status_text = "LINE READY (ONLINE)"
                 status_color = (46, 204, 113)
@@ -250,14 +251,14 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
         width: int | None = None,
         height: int | None = None,
     ) -> bytes | None:
-        """Return real WebRTC video frame snapshot or status card bytes."""
+        """Return real WebRTC video frame snapshot or status card bytes with non-blocking fallback."""
         info = self.coordinator.data.get(self.dev_id, {}).get("info", {})
         status = self.coordinator.data.get(self.dev_id, {}).get("state", "unknown")
         is_ringing = self.coordinator.data.get(self.dev_id, {}).get("ringing", False)
         is_streaming = self.coordinator.is_preview_active(self.dev_id)
         panel_name = info.get("name", f"acoGO {self.dev_id}")
 
-        # If call is active or preview is running, attempt real WebRTC keyframe capture
+        # If call is active or preview is running, attempt fast WebRTC keyframe capture
         if is_ringing or is_streaming:
             async with self._snapshot_lock:
                 params = self.coordinator.get_preview_params(self.dev_id)
@@ -274,13 +275,16 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
                         from .webrtc import async_capture_webrtc_snapshot
 
                         session = async_get_clientsession(self.hass)
+                        # Use 4.5s timeout for fast UI response without hanging Lovelace dashboard
+                        capture_timeout = 8.0 if is_ringing else 4.5
                         frame_bytes = await async_capture_webrtc_snapshot(
                             session=session,
                             aws=params["aws"],
-                            timeout=10.0,
+                            timeout=capture_timeout,
                         )
                         if frame_bytes:
                             _LOGGER.info("Captured live camera snapshot from acoGO WebRTC successfully")
+                            self._last_image = frame_bytes
                             return frame_bytes
                     except Exception as err:
                         _LOGGER.debug("WebRTC capture attempt: %s", err)
@@ -291,7 +295,11 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
                             except Exception:
                                 pass
 
-        # Fallback to status card
+        # Return cached real image if available
+        if self._last_image and is_streaming:
+            return self._last_image
+
+        # Fallback to rendered status card
         try:
             image_bytes = await self.hass.async_add_executor_job(
                 self._generate_camera_card,
@@ -305,4 +313,4 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
         except Exception as err:
             _LOGGER.warning("Error generating camera image: %s", err)
 
-        return FALLBACK_JPEG_BYTES
+        return self._last_image or FALLBACK_JPEG_BYTES
