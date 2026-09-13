@@ -1,6 +1,7 @@
 """Camera entity for ACO GO video preview and snapshots."""
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import unicodedata
@@ -82,6 +83,7 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
         Camera.__init__(self)
         self.dev_id = dev_id
         self._attr_unique_id = f"{dev_id}_camera"
+        self._snapshot_lock = asyncio.Lock()
 
     @property
     def is_on(self) -> bool:
@@ -257,36 +259,37 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
 
         # If call is active or preview is running, attempt real WebRTC keyframe capture
         if is_ringing or is_streaming:
-            params = self.coordinator.get_preview_params(self.dev_id)
-            auto_started_preview = False
-            if not params:
-                try:
-                    params = await self.coordinator.api.request_preview(self.dev_id)
-                    auto_started_preview = True
-                except Exception as err:
-                    _LOGGER.debug("Could not obtain preview session params for snapshot: %s", err)
+            async with self._snapshot_lock:
+                params = self.coordinator.get_preview_params(self.dev_id)
+                auto_started_preview = False
+                if not params:
+                    try:
+                        params = await self.coordinator.api.request_preview(self.dev_id)
+                        auto_started_preview = True
+                    except Exception as err:
+                        _LOGGER.debug("Could not obtain preview session params for snapshot: %s", err)
 
-            if params and isinstance(params.get("aws"), dict):
-                try:
-                    from .webrtc import async_capture_webrtc_snapshot
+                if params and isinstance(params.get("aws"), dict):
+                    try:
+                        from .webrtc import async_capture_webrtc_snapshot
 
-                    session = async_get_clientsession(self.hass)
-                    frame_bytes = await async_capture_webrtc_snapshot(
-                        session=session,
-                        aws=params["aws"],
-                        timeout=12.0,
-                    )
-                    if frame_bytes:
-                        _LOGGER.info("Captured live camera snapshot from acoGO WebRTC successfully")
-                        return frame_bytes
-                except Exception as err:
-                    _LOGGER.debug("WebRTC capture attempt: %s", err)
-                finally:
-                    if auto_started_preview:
-                        try:
-                            await self.coordinator.api.end_preview()
-                        except Exception:
-                            pass
+                        session = async_get_clientsession(self.hass)
+                        frame_bytes = await async_capture_webrtc_snapshot(
+                            session=session,
+                            aws=params["aws"],
+                            timeout=10.0,
+                        )
+                        if frame_bytes:
+                            _LOGGER.info("Captured live camera snapshot from acoGO WebRTC successfully")
+                            return frame_bytes
+                    except Exception as err:
+                        _LOGGER.debug("WebRTC capture attempt: %s", err)
+                    finally:
+                        if auto_started_preview:
+                            try:
+                                await self.coordinator.api.end_preview()
+                            except Exception:
+                                pass
 
         # Fallback to status card
         try:
