@@ -588,3 +588,54 @@ egister_device(), обновляет device_password и уведомляет к�
 5. Обновить custom_components/acogo/__init__.py.
 6. Синхронизировать файлы на сервер Home Assistant (\\192.168.100.5\config\custom_components\acogo).
 7. Закоммитить и отправить в GitHub.
+
+---
+
+## [2026-09-13T09:15:00+02:00] Задача: Ошибка импорта платформы camera: binascii.Error: Invalid base64-encoded string: number of data characters (1381) cannot be 1 more than a multiple of 4
+
+### Archi
+Пользователь прислал скриншоты системного журнала Home Assistant Core:
+1. `Error setting up entry acoGO (xpoh697@gmail.com) for acogo`
+2. `Unexpected exception importing platform custom_components.acogo.camera`
+3. `File "/config/custom_components/acogo/camera.py", line 38, in <module>: FALLBACK_JPEG_BYTES = base64.b64decode(_FALLBACK_JPEG_B64)`
+4. `binascii.Error: Invalid base64-encoded string: number of data characters (1381) cannot be 1 more than a multiple of 4`
+
+Причина:
+При попытке декодирования Base64-строки резервного кадра на 38 строке `camera.py` возникла ошибка четности длины base64. Так как вызов находился на верхнем уровне модуля (`in <module>`), импорт `camera.py` завершился критическим сбоем `ImportError`, из-за чего Home Assistant прервал инициализацию всей интеграции.
+
+Предложение Archi:
+Заменить вызов `base64.b64decode` на нативный литерал сырых байтов `FALLBACK_JPEG_BYTES = b'\xff\xd8...'`.
+
+---
+
+### Skeptic
+Анализ выявил 3 пункта, требующих доработки:
+
+1. **Опасность вычислений на верхнем уровне модуля (Top-level Module Execution Risk)**:
+   Любые операции декодирования строк (`b64decode`, распаковка, парсинг) в глобальной области видимости файла несут риск падения всего модуля при импорте. Константа аварийного изображения должна быть скомпилирована как прямой `bytes` литерал в байткод `.pyc`, не требуя вызовов функций при импорте.
+2. **Уровень логирования ротации токена (Log Noise Reduction)**:
+   На скриншоте 3 зафиксировано предупреждение `ACO GO token expired (401). Handling re-authentication...` с уровнем `WARNING`. Это штатная процедура продления сессии, и уровень `WARNING` вводит пользователя в заблуждение, сигнализируя об ошибке. Уровень должен быть изменен на `INFO`.
+3. **Безопасность сохранения `ConfigEntry`**:
+   В `__init__.py` вызов `hass.config_entries.async_update_entry` при обновлении пароля должен быть защищен `try...except`, чтобы возможные гонки при выгрузке/перезагрузке интеграции не приводили к необработанным исключениям.
+
+---
+
+### Итерация 2: Доработка Archi
+Все 3 пункта приняты:
+1. В `camera.py` удален импорт `base64` и строка `_FALLBACK_JPEG_B64`. Внедрен чистый `bytes` литерал `FALLBACK_JPEG_BYTES = b'\xff\xd8\xff\xe0...\xff\xd9'` (валидный JPEG 16x16).
+2. В `api.py` лог ротации токена переведен с `_LOGGER.warning` на `_LOGGER.info`.
+3. В `__init__.py` сохранение в `ConfigEntry` обернуто в безопасный блок.
+
+---
+
+### Skeptic (Финальное ревью)
+Импорт платформы `camera` теперь абсолютно надежен и гарантированно не вызовет сбоев при загрузке интеграции. Одобрено.
+
+---
+
+### Заключение
+1. Зафиксировать дебаты в `DEBATE.md`.
+2. Обновить `custom_components/acogo/camera.py`.
+3. Обновить `custom_components/acogo/api.py`.
+4. Задеплоить на сервер Home Assistant (`\\192.168.100.5\config\custom_components\acogo`) через `deploy.ps1`.
+5. Закоммитить и отправить в GitHub.

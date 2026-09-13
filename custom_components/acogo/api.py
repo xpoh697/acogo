@@ -135,7 +135,7 @@ class AcoGoApiClient:
         try:
             async with self.session.request(method, url, json=json, headers=self._get_headers(), timeout=15) as resp:
                 if resp.status == 401 and self.username and self.password:
-                    _LOGGER.warning("ACO GO token expired (401). Handling re-authentication...")
+                    _LOGGER.info("ACO GO token expired (401). Handling re-authentication...")
                     current_pwd = self.device_password
                     async with self._auth_lock:
                         # Double-checked locking: only re-register if password was not already refreshed
