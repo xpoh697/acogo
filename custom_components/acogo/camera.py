@@ -1,20 +1,19 @@
 """Camera entity for ACO GO video preview and snapshots."""
 from __future__ import annotations
 
-import asyncio
 import io
 import logging
 import unicodedata
 from datetime import datetime
 from typing import Any
 
-from homeassistant.components.camera import Camera
+from homeassistant.components.camera import Camera, CameraEntityFeature
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN, PREVIEW_AUTO_CLOSE_TIMEOUT
+from .const import DOMAIN
 from .coordinator import AcoGoDataUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -70,10 +69,11 @@ async def async_setup_entry(
 
 
 class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
-    """Representation of an ACO GO Intercom Camera."""
+    """Representation of an ACO GO Intercom Camera with native On/Off streaming controls."""
 
     _attr_has_entity_name = True
     _attr_name = "Camera"
+    _attr_supported_features = CameraEntityFeature.ON_OFF
 
     def __init__(self, coordinator: AcoGoDataUpdateCoordinator, dev_id: str) -> None:
         """Initialize camera entity."""
@@ -81,19 +81,16 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
         Camera.__init__(self)
         self.dev_id = dev_id
         self._attr_unique_id = f"{dev_id}_camera"
-        self._auto_close_task: asyncio.TimerHandle | None = None
-        self._preview_active = False
-        self._stream_params: dict[str, Any] = {}
 
     @property
     def is_on(self) -> bool:
-        """Return true if camera is active."""
+        """Return true if camera entity is available."""
         return True
 
     @property
     def is_streaming(self) -> bool:
-        """Return true if preview stream is currently requested."""
-        return self._preview_active
+        """Return true if preview stream is currently active."""
+        return self.coordinator.is_preview_active(self.dev_id)
 
     @property
     def device_info(self) -> dict[str, Any]:
@@ -109,26 +106,39 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Additional camera status attributes."""
+        """Additional camera status attributes (excluding sensitive AWS keys)."""
         info = self.coordinator.data.get(self.dev_id, {}).get("info", {})
         status = self.coordinator.data.get(self.dev_id, {}).get("state", "unknown")
         is_ringing = self.coordinator.data.get(self.dev_id, {}).get("ringing", False)
+        is_streaming = self.coordinator.is_preview_active(self.dev_id)
+
         attrs: dict[str, Any] = {
             "intercom_status": status,
             "is_ringing": is_ringing,
-            "preview_active": self._preview_active,
+            "preview_active": is_streaming,
             "stream_type": "webrtc_kvs",
             "model": info.get("model"),
             "firmware": info.get("firmware"),
             "software": info.get("software"),
         }
-        if self._stream_params:
-            attrs["channel_arn"] = self._stream_params.get("channelARN")
-            attrs["call_id"] = self._stream_params.get("callId")
-            aws_info = self._stream_params.get("aws", {})
+        params = self.coordinator.get_preview_params(self.dev_id)
+        if params:
+            attrs["call_id"] = params.get("callId")
+            aws_info = params.get("aws", {})
             if isinstance(aws_info, dict):
+                attrs["channel_arn"] = aws_info.get("channel arn") or aws_info.get("channelARN")
+                attrs["channel_name"] = aws_info.get("channel name")
                 attrs["aws_region"] = aws_info.get("region")
+                attrs["wss_endpoint"] = aws_info.get("wss endpoint")
         return attrs
+
+    async def async_turn_on(self) -> None:
+        """Turn on camera live preview stream."""
+        await self.coordinator.async_start_preview(self.dev_id)
+
+    async def async_turn_off(self) -> None:
+        """Turn off camera live preview stream."""
+        await self.coordinator.async_stop_preview(self.dev_id)
 
     def _get_font(self, size: int) -> Any:
         """Safely load font with size fallback for all Pillow versions."""
@@ -151,6 +161,7 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
         name: str,
         status: str,
         is_ringing: bool,
+        is_streaming: bool,
     ) -> bytes:
         """Render intercom live status snapshot card synchronously with clean typography."""
         try:
@@ -176,34 +187,53 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
 
             # Camera lens graphic
             cx, cy = width // 2, height // 2 - 30
-            draw.ellipse([cx - 110, cy - 110, cx + 110, cy + 110], fill=(28, 38, 58), outline=(45, 156, 219), width=3)
-            draw.ellipse([cx - 70, cy - 70, cx + 70, cy + 70], fill=(15, 20, 32), outline=(0, 210, 255), width=2)
-            draw.ellipse([cx - 24, cy - 24, cx + 24, cy + 24], fill=(0, 210, 255))
+            if is_streaming:
+                # Active streaming color palette (bright green lens)
+                lens_outer = (24, 58, 38)
+                lens_ring = (0, 230, 118)
+                lens_center = (0, 255, 128)
+            else:
+                # Idle standby color palette (cyan lens)
+                lens_outer = (28, 38, 58)
+                lens_ring = (0, 210, 255)
+                lens_center = (0, 210, 255)
+
+            draw.ellipse([cx - 110, cy - 110, cx + 110, cy + 110], fill=lens_outer, outline=(45, 156, 219), width=3)
+            draw.ellipse([cx - 70, cy - 70, cx + 70, cy + 70], fill=(15, 20, 32), outline=lens_ring, width=2)
+            draw.ellipse([cx - 24, cy - 24, cx + 24, cy + 24], fill=lens_center)
 
             # Status banner
-            if is_ringing:
+            if is_streaming:
+                status_text = "STREAMING (LIVE PREVIEW ACTIVE)"
+                status_color = (0, 230, 118)
+                sub_text = "AWS Kinesis Video Streams WebRTC | Camera Active"
+            elif is_ringing:
                 status_text = "INCOMING CALL (RINGING)"
                 status_color = (255, 75, 75)
+                sub_text = "Call Alert | Turn On Camera to View"
             elif status == "ready":
                 status_text = "LINE READY (ONLINE)"
                 status_color = (46, 204, 113)
+                sub_text = "Standby | Use 'Turn On Camera' to Stream"
             else:
                 status_text = "STANDBY / IDLE"
                 status_color = (160, 170, 185)
+                sub_text = "acoGO! 2.0 Cloud Connected"
 
             # Centered status
             st_width = self._get_text_width(draw, status_text, font_status)
             draw.text((cx - st_width // 2, cy + 140), status_text, fill=status_color, font=font_status)
 
             # Centered subtitle
-            sub_text = "AWS Kinesis Video Streams WebRTC | acoGO! 2.0"
             sub_width = self._get_text_width(draw, sub_text, font_sub)
             draw.text((cx - sub_width // 2, cy + 190), sub_text, fill=(140, 160, 185), font=font_sub)
 
             # Bottom info bar
             draw.rectangle([0, height - 54, width, height], fill=(10, 14, 22))
             draw.text((32, height - 38), "acoGO! Home Assistant Integration", fill=(100, 120, 145), font=font_small)
-            draw.text((width - 320, height - 38), "Door Lock: Ready | Gate: Ready", fill=(140, 160, 185), font=font_small)
+            footer_right = "Stream: ACTIVE" if is_streaming else "Door Lock: Ready | Gate: Ready"
+            footer_color = (0, 230, 118) if is_streaming else (140, 160, 185)
+            draw.text((width - 320, height - 38), footer_right, fill=footer_color, font=font_small)
 
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=85)
@@ -217,32 +247,11 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
         width: int | None = None,
         height: int | None = None,
     ) -> bytes | None:
-        """Return snapshot bytes and manage cloud preview session."""
-        try:
-            if not self._preview_active:
-                resp = await self.coordinator.api.request_preview(self.dev_id)
-                if isinstance(resp, dict):
-                    params = resp.get("params", {})
-                    if isinstance(params, dict):
-                        self._stream_params = params
-                self._preview_active = True
-
-            # Reset auto-close timer to prevent keeping intercom busy
-            if self._auto_close_task:
-                self._auto_close_task.cancel()
-
-            loop = asyncio.get_running_loop()
-            self._auto_close_task = loop.call_later(
-                PREVIEW_AUTO_CLOSE_TIMEOUT,
-                lambda: asyncio.create_task(self._async_close_preview()),
-            )
-        except Exception as err:
-            _LOGGER.debug("Preview request error for %s: %s", self.dev_id, err)
-
-        # Generate status card in executor (non-blocking)
+        """Return live status snapshot bytes."""
         info = self.coordinator.data.get(self.dev_id, {}).get("info", {})
         status = self.coordinator.data.get(self.dev_id, {}).get("state", "unknown")
         is_ringing = self.coordinator.data.get(self.dev_id, {}).get("ringing", False)
+        is_streaming = self.coordinator.is_preview_active(self.dev_id)
         panel_name = info.get("name", f"acoGO {self.dev_id}")
 
         try:
@@ -251,6 +260,7 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
                 panel_name,
                 status,
                 is_ringing,
+                is_streaming,
             )
             if image_bytes:
                 return image_bytes
@@ -258,20 +268,3 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
             _LOGGER.warning("Error generating camera image: %s", err)
 
         return FALLBACK_JPEG_BYTES
-
-    async def _async_close_preview(self) -> None:
-        """Ensure preview session is closed."""
-        if self._preview_active:
-            try:
-                await self.coordinator.api.end_preview()
-            except Exception as err:
-                _LOGGER.debug("Error ending preview: %s", err)
-            finally:
-                self._preview_active = False
-
-    async def async_will_remove_from_hass(self) -> None:
-        """Cleanup on entity removal."""
-        if self._auto_close_task:
-            self._auto_close_task.cancel()
-        await self._async_close_preview()
-        await super().async_will_remove_from_hass()

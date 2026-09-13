@@ -1,4 +1,4 @@
-"""Button entities for impulse open and camera switch."""
+"""Button entities for impulse open, preview, and camera switch."""
 from __future__ import annotations
 
 import logging
@@ -34,6 +34,8 @@ async def async_setup_entry(
 
         entities.append(AcoGoOpenButton(coordinator, dev_id, is_gate=False))
         entities.append(AcoGoOpenButton(coordinator, dev_id, is_gate=True))
+        entities.append(AcoGoStartPreviewButton(coordinator, dev_id))
+        entities.append(AcoGoStopPreviewButton(coordinator, dev_id))
 
         # Camera switching is only supported on PRO hardware (models 65, 67, 68)
         # with PRO-VIDEO-SW2-60 switcher module or if explicitly enabled.
@@ -79,6 +81,64 @@ class AcoGoOpenButton(CoordinatorEntity[AcoGoDataUpdateCoordinator], ButtonEntit
         except AcoGoApiError as err:
             action = "ворот" if self.is_gate else "двери"
             raise HomeAssistantError(f"Ошибка открытия {action}: {err}") from err
+
+
+class AcoGoStartPreviewButton(CoordinatorEntity[AcoGoDataUpdateCoordinator], ButtonEntity):
+    """Button to start camera live preview stream."""
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:camera"
+
+    def __init__(self, coordinator: AcoGoDataUpdateCoordinator, dev_id: str) -> None:
+        super().__init__(coordinator)
+        self.dev_id = dev_id
+        self._attr_unique_id = f"{dev_id}_start_preview"
+        self._attr_name = "Turn On Camera"
+
+    @property
+    def device_info(self) -> dict[str, Any]:
+        info = self.coordinator.data.get(self.dev_id, {}).get("info", {})
+        return {
+            "identifiers": {(DOMAIN, self.dev_id)},
+            "name": info.get("name", f"ACO Intercom {self.dev_id}"),
+            "manufacturer": "ACO",
+        }
+
+    async def async_press(self) -> None:
+        """Start camera preview session."""
+        try:
+            await self.coordinator.async_start_preview(self.dev_id)
+        except Exception as err:
+            raise HomeAssistantError(f"Не удалось включить камеру: {err}") from err
+
+
+class AcoGoStopPreviewButton(CoordinatorEntity[AcoGoDataUpdateCoordinator], ButtonEntity):
+    """Button to stop camera live preview stream."""
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:camera-off"
+
+    def __init__(self, coordinator: AcoGoDataUpdateCoordinator, dev_id: str) -> None:
+        super().__init__(coordinator)
+        self.dev_id = dev_id
+        self._attr_unique_id = f"{dev_id}_stop_preview"
+        self._attr_name = "Turn Off Camera"
+
+    @property
+    def device_info(self) -> dict[str, Any]:
+        info = self.coordinator.data.get(self.dev_id, {}).get("info", {})
+        return {
+            "identifiers": {(DOMAIN, self.dev_id)},
+            "name": info.get("name", f"ACO Intercom {self.dev_id}"),
+            "manufacturer": "ACO",
+        }
+
+    async def async_press(self) -> None:
+        """Stop camera preview session."""
+        try:
+            await self.coordinator.async_stop_preview(self.dev_id)
+        except Exception as err:
+            raise HomeAssistantError(f"Не удалось выключить камеру: {err}") from err
 
 
 class AcoGoSwitchCameraButton(CoordinatorEntity[AcoGoDataUpdateCoordinator], ButtonEntity):
