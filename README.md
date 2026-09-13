@@ -76,36 +76,94 @@
 
 ## Примеры автоматизаций
 
-### Оповещение на смартфон при звонке в домофон
+### 1. Отправка фото звонящего в Telegram с кнопками открытия
+
+При звонке в домофон автоматизация выдерживает короткую паузу для инициализации камеры, делает снимок с уникальным таймстемпом (защита от кэширования Telegram) и отправляет фото в Telegram с интерактивными инлайн-кнопками:
+
 ```yaml
-alias: "Домофон: Входящий звонок"
-trigger:
-  - platform: state
-    entity_id: binary_sensor.aco_intercom_call
-    to: "on"
-action:
-  - service: notify.notify
-    data:
-      title: "Звонок в домофон!"
-      message: "Кто-то звонит в калитку."
+- id: "acogo_doorbell_telegram_notify"
+  alias: "Домофон: Фото звонящего в Telegram"
+  description: "При звонке в домофон делает снимок с камеры и отправляет в Telegram с кнопками открытия"
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.aco_intercom_incoming_call_line_active
+      to: "on"
+  mode: single
+  action:
+    # 1. Задержка 1 секунда для согласования видеопотока камерой
+    - delay: "00:00:01"
+
+    # 2. Формируем уникальный путь файла
+    - variables:
+        snapshot_file: >-
+          /config/www/aco_bell_{{ now().strftime('%Y%m%d_%H%M%S') }}.jpg
+
+    # 3. Делаем снимок
+    - service: camera.snapshot
+      target:
+        entity_id: camera.aco_intercom_camera
       data:
-        actions:
-          - action: "OPEN_DOOR"
-            title: "Открыть дверь"
+        filename: "{{ snapshot_file }}"
+
+    # 4. Отправляем в Telegram
+    - service: telegram_bot.send_photo
+      data:
+        file: "{{ snapshot_file }}"
+        caption: >-
+          🔔 *Звонок в домофон!*
+          🕒 Время: {{ now().strftime('%H:%M:%S') }}
+        inline_keyboard:
+          - "🚪 Открыть дверь:/aco_open_door, 🚧 Открыть ворота:/aco_open_gate"
 ```
 
-### Открытие двери по кнопке из уведомления
+### 2. Обработка нажатия кнопок в Telegram (с проверкой прав)
+
 ```yaml
-alias: "Домофон: Открыть по кнопке"
-trigger:
-  - platform: event
-    event_type: mobile_app_notification_action
-    event_data:
-      action: "OPEN_DOOR"
-action:
-  - service: lock.unlock
-    target:
-      entity_id: lock.aco_intercom_door
+- id: "acogo_telegram_action_handler"
+  alias: "Домофон: Обработка команд из Telegram"
+  description: "Открытие двери или ворот по нажатию кнопок под фото в Telegram"
+  trigger:
+    - platform: event
+      event_type: telegram_callback
+      event_data:
+        data: "/aco_open_door"
+      id: "open_door"
+    - platform: event
+      event_type: telegram_callback
+      event_data:
+        data: "/aco_open_gate"
+      id: "open_gate"
+  # Защита: разрешено только доверенным User ID
+  condition:
+    - condition: template
+      value_template: >-
+        {{ trigger.event.data.user_id in [123456789, 987654321] }} # Укажите ваши Telegram User ID
+  action:
+    - choose:
+        - conditions:
+            - condition: trigger
+              id: "open_door"
+          sequence:
+            - service: lock.unlock
+              target:
+                entity_id: lock.aco_intercom_door_lock
+            - service: telegram_bot.answer_callback_query
+              data:
+                callback_query_id: "{{ trigger.event.data.id }}"
+                message: "✅ Дверь открывается!"
+
+        - conditions:
+            - condition: trigger
+              id: "open_gate"
+          sequence:
+            - service: lock.unlock
+              target:
+                entity_id: lock.aco_intercom_gate_f2
+            - service: telegram_bot.answer_callback_query
+              data:
+                callback_query_id: "{{ trigger.event.data.id }}"
+                message: "✅ Ворота открываются!"
+  mode: parallel
 ```
 
 ---
