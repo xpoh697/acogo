@@ -320,3 +320,61 @@
 1. Зафиксировать дебаты в `DEBATE.md`.
 2. Предоставить пользователю готовый production-ready YAML для `automations.yaml` с комментариями по настройке `telegram_bot`.
 3. Обновить `README.md` в репозитории с новым разделом интеграции с Telegram и запушить изменения.
+
+---
+
+## [2026-09-13T08:50:21+02:00] Задача: Исправление ошибки button/press: Connection error to order?orderId=receiveCall: 200, message='Attempt to decode JSON with unexpected mimetype: '
+
+### Archi
+Пользователь прислал скриншот ошибки при попытке открыть дверь кнопкой в Home Assistant:
+`Connection error to https://api.aco.com.pl/listener/v1/order?orderId=receiveCall: 200, message='Attempt to decode JSON with unexpected mimetype: ', url='https://api.aco.com.pl/listener/v1/order?orderId=receiveCall'`
+
+Причина очевидна:
+Сервер ACO успешно принимает команду и отвечает HTTP 200 (Success), но отдает либо `Content-Type: text/plain`, либо не указывает заголовок `Content-Type`, либо присылает пустое тело. Метод `await resp.json()` библиотеки `aiohttp` по умолчанию валидирует заголовок на соответствие `application/json` и выбрасывает исключение `ContentTypeError`.
+
+Первоначальное предложение Archi:
+Заменить `await resp.json()` на `await resp.json(content_type=None)`.
+
+---
+
+### Skeptic
+Такая правка недостаточна и приведет к новой ошибке:
+
+1. **Падение на пустом теле ответа (Empty Body JSONDecodeError)**:
+   При выполнении команд `POST /order` и `POST /preview/end` серверы часто возвращают пустой ответ (длина 0 байт) с кодом 200 OK. При вызове `resp.json(content_type=None)` на пустом ответе `aiohttp` вызовет стандартный `json.loads("")`, что приведет к фатальной ошибке `json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)`.
+2. **Игнорирование чистых текстовых ответов API**:
+   Некоторые методы ACO возвращают простой текст (например, `"OK"` или версии ПО). При попытке распарсить строку как JSON мы снова получим `JSONDecodeError`. Ответ должен сначала читаться как текст через `await resp.text()`.
+3. **Дублирование ошибки в ветке ре-аутентификации (HTTP 401)**:
+   В блоке обработки 401 ошибки повторный запрос `retry_resp` также жестко вызывал `await retry_resp.json()`. Если при повторе сервер вернет text/plain, интеграция упадет.
+
+---
+
+### Итерация 2: Доработка Archi
+Устраняем проблему полностью на уровне вспомогательного метода `_parse_response`:
+```python
+async def _parse_response(resp: aiohttp.ClientResponse) -> Any:
+    text = await resp.text()
+    if not text or not text.strip():
+        return {}
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return {"response": text.strip()}
+```
+Этот метод корректно:
+- Не падает на пустых ответах (возвращает `{}`).
+- Парсит валидный JSON независимо от того, какой `Content-Type` прислал сервер (`text/plain`, `text/html` или вовсе пустой).
+- Сохраняет не-JSON текстовые ответы в структуре `{"response": text}`.
+- Применяется как для основного запроса, так и для повторного запроса после 401, а также при регистрации устройства.
+
+---
+
+### Skeptic (Финальное ревью)
+Решение абсолютно надежно: исключение `ContentTypeError` устранено, пустые ответы и текстовые ответы серверов ACO обрабатываются штатно. Одобрено.
+
+---
+
+### Заключение
+1. Зафиксировать дебаты в `DEBATE.md`.
+2. Обновить `custom_components/acogo/api.py` с внедрением безопасного парсинга `_parse_response`.
+3. Закоммитить и выполнить `git push` в репозиторий `https://github.com/xpoh697/acogo`.

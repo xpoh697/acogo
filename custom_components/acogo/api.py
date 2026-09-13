@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 import uuid
@@ -53,6 +54,16 @@ class AcoGoApiClient:
             self._device_locks[device_id] = asyncio.Lock()
         return self._device_locks[device_id]
 
+    async def _parse_response(self, resp: aiohttp.ClientResponse) -> Any:
+        """Robustly parse response without failing on text/plain, empty bodies, or non-JSON."""
+        text = await resp.text()
+        if not text or not text.strip():
+            return {}
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return {"response": text.strip()}
+
     async def register_device(self, username: str | None = None, password: str | None = None) -> str:
         """Register client device and obtain devicePassword."""
         user = username or self.username
@@ -86,7 +97,7 @@ class AcoGoApiClient:
                 if resp.status not in (200, 201):
                     text = await resp.text()
                     raise AcoGoApiError(f"Registration failed ({resp.status}): {text}")
-                data = await resp.json()
+                data = await self._parse_response(resp)
         except aiohttp.ClientError as err:
             raise AcoGoApiError(f"Network error during registration: {err}") from err
 
@@ -120,12 +131,12 @@ class AcoGoApiClient:
                     async with self.session.request(method, url, json=json, headers=self._get_headers(), timeout=15) as retry_resp:
                         if retry_resp.status != 200:
                             raise AcoGoApiError(f"Request failed after re-auth: {retry_resp.status}")
-                        return await retry_resp.json()
+                        return await self._parse_response(retry_resp)
 
                 if resp.status != 200:
                     text = await resp.text()
                     raise AcoGoApiError(f"API error {resp.status} on {path}: {text}")
-                return await resp.json()
+                return await self._parse_response(resp)
         except aiohttp.ClientError as err:
             raise AcoGoApiError(f"Connection error to {url}: {err}") from err
 
@@ -140,16 +151,18 @@ class AcoGoApiClient:
     async def check_state(self, device_id: str) -> str:
         """Check status of intercom line ('ready', 'busy', 'offline')."""
         res = await self._request("POST", "/device/check-state", json={"devId": device_id})
-        return res.get("response", "offline")
+        if isinstance(res, dict):
+            return res.get("response", "offline")
+        return "offline"
 
     async def send_order(self, target_id: str, order_id: str) -> bool:
         """Send command to intercom."""
-        res = await self._request(
+        await self._request(
             "POST",
             f"/order?orderId={order_id}",
             json={"address": None, "targetId": target_id},
         )
-        return bool(res)
+        return True
 
     async def open_door_sequence(self, target_id: str, is_gate: bool = False) -> bool:
         """Safely execute door/gate unlock with device locking and guaranteed endCall."""
@@ -180,14 +193,15 @@ class AcoGoApiClient:
 
     async def switch_video(self, target_id: str) -> bool:
         """Switch camera video input on intercom."""
-        res = await self._request("POST", "/order/video-sw", json={"targetId": target_id})
-        return bool(res)
+        await self._request("POST", "/order/video-sw", json={"targetId": target_id})
+        return True
 
     async def request_preview(self, device_id: str) -> dict[str, Any]:
         """Request live WebRTC/Kinesis video preview session."""
-        return await self._request("POST", "/preview/request", json={"devId": device_id, "previewType": "video-only"})
+        res = await self._request("POST", "/preview/request", json={"devId": device_id, "previewType": "video-only"})
+        return res if isinstance(res, dict) else {}
 
     async def end_preview(self) -> bool:
         """Terminate video preview session."""
-        res = await self._request("POST", "/preview/end", json=None)
-        return bool(res)
+        await self._request("POST", "/preview/end", json=None)
+        return True
