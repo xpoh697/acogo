@@ -71,7 +71,7 @@ async def async_setup_entry(
 
 
 class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
-    """Representation of an ACO GO Intercom Camera with native On/Off streaming controls."""
+    """Representation of an ACO GO Intercom Camera with native snapshot and preview controls."""
 
     _attr_has_entity_name = True
     _attr_name = "Camera"
@@ -93,8 +93,11 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
 
     @property
     def is_streaming(self) -> bool:
-        """Return true if preview stream is currently active."""
-        return self.coordinator.is_preview_active(self.dev_id)
+        """Return False so Home Assistant more-info modal always renders the full image container <hui-image>."""
+        # When Camera.state returns STATE_STREAMING, Home Assistant's more-info dialog attempts
+        # to render <ha-camera-stream>, which collapses to 0 height without HLS stream support.
+        # Keeping is_streaming=False ensures HA always displays the full image view in popups and cards.
+        return False
 
     @property
     def device_info(self) -> dict[str, Any]:
@@ -119,6 +122,7 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
         attrs: dict[str, Any] = {
             "intercom_status": status,
             "is_ringing": is_ringing,
+            "is_streaming": is_streaming,
             "preview_active": is_streaming,
             "stream_type": "webrtc_kvs",
             "model": info.get("model"),
@@ -275,8 +279,8 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
                         from .webrtc import async_capture_webrtc_snapshot
 
                         session = async_get_clientsession(self.hass)
-                        # Use 4.5s timeout for fast UI response without hanging Lovelace dashboard
-                        capture_timeout = 8.0 if is_ringing else 4.5
+                        # Fast timeout for UI response without hanging Lovelace dashboard
+                        capture_timeout = 8.0 if is_ringing else 3.5
                         frame_bytes = await async_capture_webrtc_snapshot(
                             session=session,
                             aws=params["aws"],
