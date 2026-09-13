@@ -1,11 +1,10 @@
-"""Async API Client for ACO GO Cloud."""
+"""REST API client for ACO GO 2.0 Cloud."""
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-from typing import Any
-import uuid
+from typing import Any, Callable
 
 import aiohttp
 
@@ -22,16 +21,16 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 
-class AcoGoAuthError(Exception):
-    """Authentication failure."""
-
-
 class AcoGoApiError(Exception):
-    """General API communication error."""
+    """General ACO GO API exception."""
+
+
+class AcoGoAuthError(AcoGoApiError):
+    """Authentication or authorization failure."""
 
 
 class AcoGoApiClient:
-    """Client for https://api.aco.com.pl/listener/v1."""
+    """Async client to interact with aco.com.pl listener API."""
 
     def __init__(
         self,
@@ -40,13 +39,16 @@ class AcoGoApiClient:
         device_password: str | None = None,
         username: str | None = None,
         password: str | None = None,
+        on_device_password_updated: Callable[[str], Any] | None = None,
     ) -> None:
         self.session = session
         self.dev_id = dev_id
         self.device_password = device_password
         self.username = username
         self.password = password
+        self.on_device_password_updated = on_device_password_updated
         self._device_locks: dict[str, asyncio.Lock] = {}
+        self._auth_lock = asyncio.Lock()
 
     def get_device_lock(self, device_id: str) -> asyncio.Lock:
         """Get or create an asyncio lock for a specific intercom device."""
@@ -109,6 +111,13 @@ class AcoGoApiClient:
         self.device_password = dev_pwd
         self.username = user
         self.password = pwd
+
+        if self.on_device_password_updated:
+            try:
+                self.on_device_password_updated(dev_pwd)
+            except Exception as err:
+                _LOGGER.debug("Error in on_device_password_updated callback: %s", err)
+
         return dev_pwd
 
     def _get_headers(self) -> dict[str, str]:
@@ -126,14 +135,21 @@ class AcoGoApiClient:
         try:
             async with self.session.request(method, url, json=json, headers=self._get_headers(), timeout=15) as resp:
                 if resp.status == 401 and self.username and self.password:
-                    _LOGGER.warning("ACO GO token expired (401). Attempting re-authentication...")
-                    await self.register_device()
+                    _LOGGER.warning("ACO GO token expired (401). Handling re-authentication...")
+                    current_pwd = self.device_password
+                    async with self._auth_lock:
+                        # Double-checked locking: only re-register if password was not already refreshed
+                        if self.device_password == current_pwd:
+                            await self.register_device()
+
+                    # Retry with refreshed password
                     async with self.session.request(method, url, json=json, headers=self._get_headers(), timeout=15) as retry_resp:
-                        if retry_resp.status != 200:
-                            raise AcoGoApiError(f"Request failed after re-auth: {retry_resp.status}")
+                        if retry_resp.status not in (200, 201):
+                            text = await retry_resp.text()
+                            raise AcoGoApiError(f"Request failed after re-auth: {retry_resp.status} on {path}: {text}")
                         return await self._parse_response(retry_resp)
 
-                if resp.status != 200:
+                if resp.status not in (200, 201):
                     text = await resp.text()
                     raise AcoGoApiError(f"API error {resp.status} on {path}: {text}")
                 return await self._parse_response(resp)
@@ -167,7 +183,8 @@ class AcoGoApiClient:
     async def open_door_sequence(self, target_id: str, is_gate: bool = False) -> bool:
         """Safely execute door/gate unlock with device locking and guaranteed endCall."""
         lock = self.get_device_lock(target_id)
-        order_cmd = ORDER_F2_OPEN if is_gate else ORDER_EZ_OPEN
+        # Door is f2Open and Gate is ezOpen
+        order_cmd = ORDER_EZ_OPEN if is_gate else ORDER_F2_OPEN
 
         async with lock:
             state = await self.check_state(target_id)
@@ -192,9 +209,11 @@ class AcoGoApiClient:
                     _LOGGER.error("Failed to send endCall for %s: %s", target_id, err)
 
     async def switch_video(self, target_id: str) -> bool:
-        """Switch camera video input on intercom."""
-        await self._request("POST", "/order/video-sw", json={"targetId": target_id})
-        return True
+        """Switch camera video input on intercom with lock protection."""
+        lock = self.get_device_lock(target_id)
+        async with lock:
+            await self._request("POST", "/order/video-sw", json={"targetId": target_id})
+            return True
 
     async def request_preview(self, device_id: str) -> dict[str, Any]:
         """Request live WebRTC/Kinesis video preview session."""

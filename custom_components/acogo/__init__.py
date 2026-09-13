@@ -27,12 +27,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})
 
     session = async_get_clientsession(hass)
+
+    def _on_password_updated(new_password: str) -> None:
+        """Persist newly rotated devicePassword to ConfigEntry."""
+        _LOGGER.info("Persisting rotated acoGO devicePassword to ConfigEntry")
+        hass.config_entries.async_update_entry(
+            entry,
+            data={**entry.data, CONF_DEVICE_PASSWORD: new_password},
+        )
+
     client = AcoGoApiClient(
         session=session,
         dev_id=entry.data[CONF_DEV_ID],
         device_password=entry.data[CONF_DEVICE_PASSWORD],
         username=entry.data.get(CONF_USERNAME),
         password=entry.data.get(CONF_PASSWORD),
+        on_device_password_updated=_on_password_updated,
     )
 
     coordinator = AcoGoDataUpdateCoordinator(hass, client)

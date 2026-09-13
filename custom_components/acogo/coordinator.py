@@ -27,14 +27,20 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.api = api
 
     async def _async_update_data(self) -> dict[str, Any]:
-        """Fetch data from ACO GO Cloud."""
+        """Fetch data from ACO GO Cloud with graceful degradation on transient glitches."""
         try:
             devices = await self.api.get_device_list()
             devices_data: dict[str, Any] = {}
 
             for dev in devices:
                 dev_id = dev["devId"]
-                state_resp = await self.api.check_state(dev_id)
+                try:
+                    state_resp = await self.api.check_state(dev_id)
+                except Exception as state_err:
+                    _LOGGER.warning("Temporary error checking state for %s: %s", dev_id, state_err)
+                    prev_state = self.data.get(dev_id, {}).get("state", "ready") if self.data else "ready"
+                    state_resp = prev_state
+
                 devices_data[dev_id] = {
                     "info": dev,
                     "state": state_resp,  # 'ready', 'busy', 'offline'
@@ -44,4 +50,7 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             return devices_data
         except AcoGoApiError as err:
+            if self.data:
+                _LOGGER.warning("Temporary error updating ACO GO data (maintaining cached state): %s", err)
+                return self.data
             raise UpdateFailed(f"Error communicating with ACO API: {err}") from err
