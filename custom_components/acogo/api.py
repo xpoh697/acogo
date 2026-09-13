@@ -134,20 +134,30 @@ class AcoGoApiClient:
         url = f"{BASE_URL}{path}"
         try:
             async with self.session.request(method, url, json=json, headers=self._get_headers(), timeout=15) as resp:
-                if resp.status == 401 and self.username and self.password:
-                    _LOGGER.info("ACO GO token expired (401). Handling re-authentication...")
-                    current_pwd = self.device_password
-                    async with self._auth_lock:
-                        # Double-checked locking: only re-register if password was not already refreshed
-                        if self.device_password == current_pwd:
-                            await self.register_device()
+                if resp.status == 401:
+                    # Specific check: 401 on /order/video-sw is a feature authorization rejection
+                    # (device lacks PRO multi-camera hardware/license), NOT an expired token!
+                    if path == "/order/video-sw":
+                        text = await resp.text()
+                        raise AcoGoApiError(
+                            f"Camera switching (video-sw) is not supported or authorized by cloud for device "
+                            f"(PRO model and PRO-VIDEO-SW2-60 required): {text}"
+                        )
 
-                    # Retry with refreshed password
-                    async with self.session.request(method, url, json=json, headers=self._get_headers(), timeout=15) as retry_resp:
-                        if retry_resp.status not in (200, 201):
-                            text = await retry_resp.text()
-                            raise AcoGoApiError(f"Request failed after re-auth: {retry_resp.status} on {path}: {text}")
-                        return await self._parse_response(retry_resp)
+                    if self.username and self.password:
+                        _LOGGER.info("ACO GO token expired (401). Handling re-authentication...")
+                        current_pwd = self.device_password
+                        async with self._auth_lock:
+                            # Double-checked locking: only re-register if password was not already refreshed
+                            if self.device_password == current_pwd:
+                                await self.register_device()
+
+                        # Retry with refreshed password
+                        async with self.session.request(method, url, json=json, headers=self._get_headers(), timeout=15) as retry_resp:
+                            if retry_resp.status not in (200, 201):
+                                text = await retry_resp.text()
+                                raise AcoGoApiError(f"Request failed after re-auth: {retry_resp.status} on {path}: {text}")
+                            return await self._parse_response(retry_resp)
 
                 if resp.status not in (200, 201):
                     text = await resp.text()
