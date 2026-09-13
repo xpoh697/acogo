@@ -25,6 +25,10 @@ wheels/
 acogo.apk
 extracted_www/
 
+# Local deployment scripts with private network paths
+deploy.ps1
+*.ps1
+
 # OS / Editor files
 .DS_Store
 Thumbs.db
