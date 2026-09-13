@@ -200,3 +200,75 @@
 2. Инициализировать git-репозиторий, добавить remote `origin https://github.com/xpoh697/acogo.git`.
 3. Закоммитить чистые файлы проекта (`custom_components/acogo`, `hacs.json`, `README.md`, `LICENSE`, `icon.png`, `logo.png`, `technical_specification.md`, `DEBATE.md`).
 4. Выполнить `git push -u origin main`.
+
+---
+
+## [2026-09-13T08:40:00+02:00] Задача: изучи тут E:\HA_INTEGRATIONS\EMS как надо иконки размещать что бы они в HACS отображались
+
+### Archi
+Изучил структуру эталонной интеграции `E:\HA_INTEGRATIONS\EMS`.
+Вот ключевое отличие и паттерн размещения брендовых ассетов:
+1. **Каталог `brand/` внутри компонента**:
+   В проекте EMS иконка и логотип размещены в каталоге:
+   `custom_components/ems/brand/icon.png`
+   `custom_components/ems/brand/logo.png`
+   В Home Assistant и HACS именно папка `custom_components/<domain>/brand/` используется для загрузки иконок и логотипов как локально, так и в магазине HACS.
+2. **Параметры `hacs.json` в EMS**:
+   ```json
+   {
+     "name": "acoGO! Intercom",
+     "render_readme": true,
+     "hacs": "1.0.0",
+     "hide_default_branch": true,
+     "homeassistant": "2024.1.0"
+   }
+   ```
+Предлагаю:
+- Создать папку `custom_components/acogo/brand/` и скопировать туда `icon.png` и `logo.png`.
+- Сохранить `icon.png` и `logo.png` также в корне репозитория (для GitHub README).
+- Обновить `hacs.json` полями `"hacs": "1.0.0"` и `"hide_default_branch": true`.
+- Закоммитить и запушить в репозиторий.
+
+---
+
+### Skeptic
+Анализ эталонного решения EMS:
+
+1. **Строгие требования HACS Brands к `custom_components/<domain>/brand/`**:
+   HACS парсит иконки либо через глобальный репозиторий `home-assistant/brands`, либо (для кастомных интеграций) ищет их строго по пути `custom_components/<domain>/brand/icon.png` и `custom_components/<domain>/brand/logo.png`. Ранее мы положили `icon.png` прямо в корень компонента, а не в подпапку `brand/`. Перенос в `brand/` строго обязателен для корректного отображения в HACS UI.
+2. **Консистентность ссылок в `README.md`**:
+   В `README.md` используется `<img src="icon.png" ...>`. Если удалить файл из корня, картинка в README на странице GitHub и в рендере HACS сломается. Поэтому `icon.png` обязательно должен присутствовать и в корне репозитория, и в `custom_components/acogo/brand/icon.png`.
+3. **Параметр `hide_default_branch` в `hacs.json`**:
+   В `hacs.json` флаг `"hide_default_branch": true` скрывает ветку по умолчанию, заставляя HACS предлагать пользователям устанавливать релизные теги (releases). Если в репозитории еще нет тегов/релизов (GitHub Releases), пользователь может не увидеть интеграцию или получить предупреждение. Поэтому лучше оставить ветку доступной или создать релиз `v1.0.0`.
+
+---
+
+### Итерация 2: Доработка Archi
+Учтено:
+1. Создаем каталог `custom_components/acogo/brand/` и размещаем там:
+   - `custom_components/acogo/brand/icon.png`
+   - `custom_components/acogo/brand/logo.png`
+2. Оставляем `icon.png` и `logo.png` в корне репозитория для GitHub `README.md`.
+3. Обновляем `hacs.json`:
+   ```json
+   {
+     "name": "acoGO! Intercom",
+     "render_readme": true,
+     "hacs": "1.0.0",
+     "homeassistant": "2024.1.0"
+   }
+   ```
+4. Фиксируем изменения в git и пушим в origin.
+
+---
+
+### Skeptic (Финальное ревью)
+Структура полностью соответствует эталону EMS и современному стандарту HACS Brands для кастомных интеграций. Готово к применению.
+
+---
+
+### Заключение
+1. Создать каталог `custom_components/acogo/brand/`.
+2. Скопировать `icon.png` и `logo.png` в `custom_components/acogo/brand/`.
+3. Обновить `hacs.json`.
+4. Закоммитить и выполнить `git push`.
