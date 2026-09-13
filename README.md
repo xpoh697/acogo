@@ -22,7 +22,7 @@
 - 📹 **Переключение видеокамер**: Кнопка циклического переключения видеовходов вызывной панели (`video-sw`).
 - 🔔 **Детекция звонков**: Бинарный сенсор входящего вызова (`busy` / `ready`) для мгновенного запуска автоматизаций Home Assistant (оповещения на телефон, умные колонки, подсветка).
 - 📶 **Мониторинг состояния**: Сенсор доступности панели (Online / Offline), версии ПО и прошивки.
-- 📷 **Камера вызывной панели**: Поддержка видеопотока через AWS Kinesis Video Streams WebRTC с автоматическим закрытием сессии при неактивности (защита от исчерпания облачных квот).
+- 📷 **Камера вызывной панели**: Поддержка видеопотока и захвата кадров через AWS Kinesis Video Streams WebRTC с автоматическим закрытием сессии при неактивности (защита от исчерпания облачных квот).
 - ⚙️ **Удобная настройка через UI**: Авторизация по учетным данным портала myAco / acoGO с автоматической генерацией сессии устройства.
 
 ---
@@ -76,94 +76,124 @@
 
 ## Примеры автоматизаций
 
+> [!TIP]
+> **Синтаксис Home Assistant 2024+**: В примерах используется актуальный синтаксис `action:`. Если вы используете версию Home Assistant ниже 2024.8, замените `action:` на `service:`.
+
 ### 1. Отправка фото звонящего в Telegram с кнопками открытия
 
-При звонке в домофон автоматизация выдерживает короткую паузу для инициализации камеры, делает снимок с уникальным таймстемпом (защита от кэширования Telegram) и отправляет фото в Telegram с интерактивными инлайн-кнопками:
+При звонке в домофон автоматизация выдерживает паузу **3 секунды** (необходима физической матрице камеры домофона для разогрева оптического сенсора и формирования первого ключевого кадра H.264), делает снимок лица посетителя с уникальным таймстемпом и отправляет в Telegram с инлайн-кнопками мгновенного открытия:
 
 ```yaml
 - id: "acogo_doorbell_telegram_notify"
   alias: "Домофон: Фото звонящего в Telegram"
   description: "При звонке в домофон делает снимок с камеры и отправляет в Telegram с кнопками открытия"
-  trigger:
-    - platform: state
-      entity_id: binary_sensor.aco_intercom_incoming_call_line_active
-      to: "on"
+  triggers:
+    - trigger: state
+      entity_id:
+        - binary_sensor.aco_intercom_incoming_call_line_active  # Замените на entity_id вашей панели
+      to:
+        - "on"
   mode: single
-  action:
-    # 1. Задержка 1 секунда для согласования видеопотока камерой
-    - delay: "00:00:01"
+  actions:
+    # 1. Задержка 3 секунды для разогрева оптики домофона и генерации I-frame
+    - delay: "00:00:03"
 
-    # 2. Формируем уникальный путь файла
+    # 2. Формируем уникальный путь файла (защита от кэширования в Telegram)
     - variables:
         snapshot_file: >-
           /config/www/aco_bell_{{ now().strftime('%Y%m%d_%H%M%S') }}.jpg
 
-    # 3. Делаем снимок
-    - service: camera.snapshot
+    # 3. Делаем снимок (захват реального WebRTC-кадра через интеграцию)
+    - action: camera.snapshot
       target:
-        entity_id: camera.aco_intercom_camera
+        entity_id: camera.aco_intercom_camera  # Замените на entity_id вашей камеры
       data:
         filename: "{{ snapshot_file }}"
 
-    # 4. Отправляем в Telegram
-    - service: telegram_bot.send_photo
+    # 4. Отправляем фото в Telegram
+    - action: telegram_bot.send_photo
       data:
         file: "{{ snapshot_file }}"
         caption: >-
-          🔔 *Звонок в домофон!*
-          🕒 Время: {{ now().strftime('%H:%M:%S') }}
+          🔔 *Звонок в домофон!* 🕒 Время: {{ now().strftime('%H:%M:%S') }}
         inline_keyboard:
           - "🚪 Открыть дверь:/aco_open_door, 🚧 Открыть ворота:/aco_open_gate"
 ```
 
-### 2. Обработка нажатия кнопок в Telegram (с проверкой прав)
+---
+
+### 2. Обработка нажатия кнопок в Telegram (с защитой по User ID)
+
+Нажатие кнопок под фото в Telegram мгновенно открывает дверь или ворота. В автоматизацию встроена проверка прав по `user_id` Telegram, исключающая несанкционированное открытие посторонними лицами.
 
 ```yaml
 - id: "acogo_telegram_action_handler"
   alias: "Домофон: Обработка команд из Telegram"
   description: "Открытие двери или ворот по нажатию кнопок под фото в Telegram"
-  trigger:
-    - platform: event
+  triggers:
+    - trigger: event
       event_type: telegram_callback
       event_data:
-        data: "/aco_open_door"
-      id: "open_door"
-    - platform: event
+        data: /aco_open_door
+      id: open_door
+    - trigger: event
       event_type: telegram_callback
       event_data:
-        data: "/aco_open_gate"
-      id: "open_gate"
-  # Защита: разрешено только доверенным User ID
-  condition:
+        data: /aco_open_gate
+      id: open_gate
+  # Защита: разрешено только доверенным Telegram User ID
+  conditions:
     - condition: template
       value_template: >-
         {{ trigger.event.data.user_id in [123456789, 987654321] }} # Укажите ваши Telegram User ID
-  action:
+  actions:
     - choose:
+        # Открытие двери (Замок 1)
         - conditions:
             - condition: trigger
-              id: "open_door"
+              id: open_door
           sequence:
-            - service: lock.unlock
+            - action: button.press
               target:
-                entity_id: lock.aco_intercom_door_lock
-            - service: telegram_bot.answer_callback_query
+                entity_id: button.aco_intercom_open_door  # Либо lock.unlock на lock.aco_intercom_door_lock
+            - action: telegram_bot.answer_callback_query
               data:
                 callback_query_id: "{{ trigger.event.data.id }}"
                 message: "✅ Дверь открывается!"
+                show_alert: false
 
+        # Открытие въездных ворот (Замок 2 / F2)
         - conditions:
             - condition: trigger
-              id: "open_gate"
+              id: open_gate
           sequence:
-            - service: lock.unlock
+            - action: button.press
               target:
-                entity_id: lock.aco_intercom_gate_f2
-            - service: telegram_bot.answer_callback_query
+                entity_id: button.aco_intercom_open_gate  # Либо lock.unlock на lock.aco_intercom_gate_f2
+            - action: telegram_bot.answer_callback_query
               data:
                 callback_query_id: "{{ trigger.event.data.id }}"
                 message: "✅ Ворота открываются!"
+                show_alert: false
   mode: parallel
+```
+
+---
+
+### 3. Автоматическая очистка старых снимков звонков (Опционально)
+
+Чтобы накопитель Home Assistant не забивался архивными снимками посетителей, добавьте регулярную очистку файлов старше 7 дней раз в сутки:
+
+```yaml
+- id: "acogo_cleanup_snapshots"
+  alias: "Домофон: Очистка старых фото звонков"
+  description: "Удаляет снимки звонков старше 7 дней из папки /config/www"
+  triggers:
+    - trigger: time
+      at: "04:00:00"
+  actions:
+    - action: shell_command.purge_old_aco_bell_photos  # Задайте в configuration.yaml: find /config/www -name 'aco_bell_*.jpg' -mtime +7 -delete
+  mode: single
 ```
 
 ---
