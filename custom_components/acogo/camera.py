@@ -258,9 +258,11 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
         # If call is active or preview is running, attempt real WebRTC keyframe capture
         if is_ringing or is_streaming:
             params = self.coordinator.get_preview_params(self.dev_id)
+            auto_started_preview = False
             if not params:
                 try:
                     params = await self.coordinator.api.request_preview(self.dev_id)
+                    auto_started_preview = True
                 except Exception as err:
                     _LOGGER.debug("Could not obtain preview session params for snapshot: %s", err)
 
@@ -272,13 +274,19 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
                     frame_bytes = await async_capture_webrtc_snapshot(
                         session=session,
                         aws=params["aws"],
-                        timeout=6.0,
+                        timeout=12.0,
                     )
                     if frame_bytes:
                         _LOGGER.info("Captured live camera snapshot from acoGO WebRTC successfully")
                         return frame_bytes
                 except Exception as err:
                     _LOGGER.debug("WebRTC capture attempt: %s", err)
+                finally:
+                    if auto_started_preview:
+                        try:
+                            await self.coordinator.api.end_preview()
+                        except Exception:
+                            pass
 
         # Fallback to status card
         try:

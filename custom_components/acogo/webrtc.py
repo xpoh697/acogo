@@ -76,7 +76,7 @@ def generate_signed_wss_url(aws: dict[str, Any], client_id: str) -> str:
 async def async_capture_webrtc_snapshot(
     session: Any,
     aws: dict[str, Any],
-    timeout: float = 7.0,
+    timeout: float = 12.0,
 ) -> bytes | None:
     """Connect as WebRTC viewer to AWS KVS, receive 1 video frame, and return JPEG bytes."""
     try:
@@ -123,7 +123,7 @@ async def async_capture_webrtc_snapshot(
             asyncio.create_task(_recv_frame())
 
     try:
-        async with session.ws_connect(signed_url, timeout=5.0) as ws:
+        async with session.ws_connect(signed_url, timeout=10.0) as ws:
             offer = await pc.createOffer()
             await pc.setLocalDescription(offer)
 
