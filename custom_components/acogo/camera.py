@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import unicodedata
 from datetime import datetime
 from typing import Any
 
@@ -40,6 +41,17 @@ FALLBACK_JPEG_BYTES = (
     b"\xf3\xf4\xf5\xf6\xf7\xf8\xf9\xfa\xff\xda\x00\x0c\x03\x01\x00\x02\x11\x03\x11\x00?\x00\xe2\xe8\xa2\x8a"
     b"\xb1\x1f\xff\xd9"
 )
+
+
+def _sanitize_ascii(text: str) -> str:
+    """Normalize unicode and filter strictly to printable ASCII."""
+    replacements = {"ł": "l", "Ł": "L", "—": "-", "–": "-"}
+    for k, v in replacements.items():
+        text = text.replace(k, v)
+    nfkd = unicodedata.normalize("NFKD", text)
+    ascii_chars = [c for c in nfkd if not unicodedata.combining(c)]
+    clean_str = "".join(ascii_chars)
+    return "".join(c for c in clean_str if 32 <= ord(c) < 127)
 
 
 async def async_setup_entry(
@@ -118,13 +130,29 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
                 attrs["aws_region"] = aws_info.get("region")
         return attrs
 
+    def _get_font(self, size: int) -> Any:
+        """Safely load font with size fallback for all Pillow versions."""
+        from PIL import ImageFont
+        try:
+            return ImageFont.load_default(size=size)
+        except Exception:
+            return ImageFont.load_default()
+
+    def _get_text_width(self, draw: Any, text: str, font: Any) -> int:
+        """Safely calculate text width across Pillow versions."""
+        try:
+            bbox = draw.textbbox((0, 0), text, font=font)
+            return int(bbox[2] - bbox[0])
+        except Exception:
+            return len(text) * 12
+
     def _generate_camera_card(
         self,
         name: str,
         status: str,
         is_ringing: bool,
     ) -> bytes:
-        """Render intercom live status snapshot card synchronously."""
+        """Render intercom live status snapshot card synchronously with clean typography."""
         try:
             from PIL import Image, ImageDraw
 
@@ -132,36 +160,50 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
             img = Image.new("RGB", (width, height), color=(18, 24, 38))
             draw = ImageDraw.Draw(img)
 
+            # Fonts with safe size scaling
+            font_title = self._get_font(24)
+            font_status = self._get_font(34)
+            font_sub = self._get_font(20)
+            font_small = self._get_font(18)
+
             # Top header bar
             draw.rectangle([0, 0, width, 64], fill=(10, 14, 22))
+            clean_name = _sanitize_ascii(name.upper())
+            title_text = f"ACO INTERCOM - {clean_name}"
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            draw.text((32, 22), f"ACO DOMOFON — {name.upper()}", fill=(255, 255, 255))
-            draw.text((width - 240, 22), now_str, fill=(180, 190, 205))
+            draw.text((32, 20), title_text, fill=(255, 255, 255), font=font_title)
+            draw.text((width - 270, 20), now_str, fill=(180, 190, 205), font=font_title)
 
             # Camera lens graphic
             cx, cy = width // 2, height // 2 - 30
-            draw.ellipse([cx - 100, cy - 100, cx + 100, cy + 100], fill=(28, 38, 58), outline=(45, 156, 219), width=3)
-            draw.ellipse([cx - 60, cy - 60, cx + 60, cy + 60], fill=(15, 20, 32), outline=(0, 210, 255), width=2)
-            draw.ellipse([cx - 20, cy - 20, cx + 20, cy + 20], fill=(0, 210, 255))
+            draw.ellipse([cx - 110, cy - 110, cx + 110, cy + 110], fill=(28, 38, 58), outline=(45, 156, 219), width=3)
+            draw.ellipse([cx - 70, cy - 70, cx + 70, cy + 70], fill=(15, 20, 32), outline=(0, 210, 255), width=2)
+            draw.ellipse([cx - 24, cy - 24, cx + 24, cy + 24], fill=(0, 210, 255))
 
             # Status banner
             if is_ringing:
-                status_text = "ВХОДЯЩИЙ ВЫЗОВ (ЗВОНОК)"
+                status_text = "INCOMING CALL (RINGING)"
                 status_color = (255, 75, 75)
             elif status == "ready":
-                status_text = "ЛИНИЯ ГОТОВА (ОНЛАЙН)"
+                status_text = "LINE READY (ONLINE)"
                 status_color = (46, 204, 113)
             else:
-                status_text = "ПАНЕЛЬ ОЖИДАЕТ ВЫЗОВА / ОФФЛАЙН"
+                status_text = "STANDBY / IDLE"
                 status_color = (160, 170, 185)
 
-            draw.text((cx - 130, cy + 130), status_text, fill=status_color)
-            draw.text((cx - 150, cy + 165), "AWS Kinesis Video Streams WebRTC | acoGO! 2.0", fill=(140, 160, 185))
+            # Centered status
+            st_width = self._get_text_width(draw, status_text, font_status)
+            draw.text((cx - st_width // 2, cy + 140), status_text, fill=status_color, font=font_status)
+
+            # Centered subtitle
+            sub_text = "AWS Kinesis Video Streams WebRTC | acoGO! 2.0"
+            sub_width = self._get_text_width(draw, sub_text, font_sub)
+            draw.text((cx - sub_width // 2, cy + 190), sub_text, fill=(140, 160, 185), font=font_sub)
 
             # Bottom info bar
             draw.rectangle([0, height - 54, width, height], fill=(10, 14, 22))
-            draw.text((32, height - 36), "acoGO! Home Assistant Integration", fill=(100, 120, 145))
-            draw.text((width - 320, height - 36), "Электрозамок: Готов | Ворота: Готовы", fill=(140, 160, 185))
+            draw.text((32, height - 38), "acoGO! Home Assistant Integration", fill=(100, 120, 145), font=font_small)
+            draw.text((width - 320, height - 38), "Door Lock: Ready | Gate: Ready", fill=(140, 160, 185), font=font_small)
 
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=85)
