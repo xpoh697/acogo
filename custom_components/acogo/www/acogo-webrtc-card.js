@@ -16,6 +16,17 @@ class AcoGoWebRtcCard extends HTMLElement {
     this._statusText = 'ГОТОВ К ТРАНСЛЯЦИИ';
   }
 
+  static getStubConfig() {
+    return {
+      title: 'acoGO! Julianów',
+      device_id: '01:01:26:79'
+    };
+  }
+
+  getCardSize() {
+    return 6;
+  }
+
   setConfig(config) {
     this._config = {
       title: 'acoGO! Intercom',
@@ -29,14 +40,22 @@ class AcoGoWebRtcCard extends HTMLElement {
 
   set hass(hass) {
     this._hass = hass;
-    if (!this._config.door_entity || !this._config.gate_entity) {
-      // Auto-discover locks/buttons for acogo
+    if (!hass) return;
+
+    // Auto-discover locks/buttons for acogo if not set or invalid
+    if (!this._config.door_entity || !hass.states[this._config.door_entity]) {
       for (const eid in hass.states) {
-        if (eid.startsWith('lock.acogo_') && eid.includes('door') && !this._config.door_entity) {
+        if (eid.startsWith('lock.') && eid.includes('acogo') && eid.includes('door')) {
           this._config.door_entity = eid;
+          break;
         }
-        if (eid.startsWith('lock.acogo_') && eid.includes('gate') && !this._config.gate_entity) {
+      }
+    }
+    if (!this._config.gate_entity || !hass.states[this._config.gate_entity]) {
+      for (const eid in hass.states) {
+        if (eid.startsWith('lock.') && eid.includes('acogo') && (eid.includes('gate') || eid.includes('f2'))) {
           this._config.gate_entity = eid;
+          break;
         }
       }
     }
@@ -124,8 +143,8 @@ class AcoGoWebRtcCard extends HTMLElement {
           padding: 20px;
         }
         .lens-graphic {
-          width: 90px;
-          height: 90px;
+          width: 80px;
+          height: 80px;
           border-radius: 50%;
           border: 3px solid #00d2ff;
           display: flex;
@@ -219,7 +238,7 @@ class AcoGoWebRtcCard extends HTMLElement {
 
           <div id="overlayIdle" class="overlay-idle">
             <div class="lens-graphic">
-              <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2">
+              <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2">
                 <circle cx="12" cy="12" r="10"></circle>
                 <circle cx="12" cy="12" r="3"></circle>
               </svg>
@@ -470,21 +489,23 @@ class AcoGoWebRtcCard extends HTMLElement {
   }
 
   _unlockDoor() {
-    if (this._config.door_entity && this._hass) {
-      this._hass.callService('lock', 'unlock', { entity_id: this._config.door_entity });
+    const doorEntity = this._config.door_entity || 'lock.ulitsa_acogo_julianow_door_lock';
+    if (this._hass && this._hass.states[doorEntity]) {
+      this._hass.callService('lock', 'unlock', { entity_id: doorEntity });
     } else {
-      this._hass.callService('button', 'press', { entity_id: 'button.acogo_julianow_open_door' }).catch(() => {
-        alert('Сущность замка двери не настроена в карточке');
+      this._hass.callService('button', 'press', { entity_id: 'button.ulitsa_acogo_julianow_open_door' }).catch(() => {
+        alert('Сущность замка двери не найдена в Home Assistant');
       });
     }
   }
 
   _unlockGate() {
-    if (this._config.gate_entity && this._hass) {
-      this._hass.callService('lock', 'unlock', { entity_id: this._config.gate_entity });
+    const gateEntity = this._config.gate_entity || 'lock.ulitsa_acogo_julianow_gate_f2';
+    if (this._hass && this._hass.states[gateEntity]) {
+      this._hass.callService('lock', 'unlock', { entity_id: gateEntity });
     } else {
-      this._hass.callService('button', 'press', { entity_id: 'button.acogo_julianow_open_gate' }).catch(() => {
-        alert('Сущность замка ворот не настроена в карточке');
+      this._hass.callService('button', 'press', { entity_id: 'button.ulitsa_acogo_julianow_open_gate' }).catch(() => {
+        alert('Сущность замка ворот не найдена в Home Assistant');
       });
     }
   }
@@ -498,4 +519,4 @@ window.customCards.push({
   name: 'acoGO! Live WebRTC Camera',
   description: 'Прямой видеопоток 30 FPS с домофона acoGO через браузерный WebRTC'
 });
-console.info('%c ACOGO-WEBRTC-CARD %c v1.0.0 Loaded ', 'background:#0284c7;color:#fff;font-weight:bold;', 'background:#0d121c;color:#10b981;');
+console.info('%c ACOGO-WEBRTC-CARD %c v1.0.1 Loaded ', 'background:#0284c7;color:#fff;font-weight:bold;', 'background:#0d121c;color:#10b981;');
