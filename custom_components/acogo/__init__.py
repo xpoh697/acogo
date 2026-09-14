@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import Any
+import uuid
 
 from aiohttp import web
 
@@ -188,7 +189,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             raise HomeAssistantError("AWS credentials not available from cloud preview session")
 
         from .webrtc import generate_signed_wss_url, fetch_ice_servers
-        client_id = f"HABrowser_{device_id.replace(':', '')}"
+        # Generate unique random client_id for every viewer session to avoid KVS session collisions
+        client_id = f"HABrowser_{uuid.uuid4().hex[:8]}"
         wss_url = generate_signed_wss_url(aws, client_id)
         ice_servers = await fetch_ice_servers(session, aws)
         ice_list: list[dict[str, Any]] = []

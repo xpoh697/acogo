@@ -1,8 +1,17 @@
 /**
  * acoGO! Live WebRTC Lovelace Card
  * Directly connects to AWS Kinesis Video Streams WebRTC for ultra-low latency intercom video feed.
- * Version: 1.0.4
+ * Version: 1.0.5
  */
+
+function safeBtoa(obj) {
+  const str = typeof obj === 'string' ? obj : JSON.stringify(obj);
+  try {
+    return btoa(str);
+  } catch (e) {
+    return btoa(encodeURIComponent(str).replace(/%([0-9A-F]{2})/g, (_, p1) => String.fromCharCode('0x' + p1)));
+  }
+}
 
 class AcoGoWebRtcCard extends HTMLElement {
   constructor() {
@@ -14,6 +23,8 @@ class AcoGoWebRtcCard extends HTMLElement {
     this._countdown = 0;
     this._countdownInterval = null;
     this._connectTimeout = null;
+    this._waitInterval = null;
+    this._waitingSeconds = 0;
     this._pendingIceCandidates = [];
     this._hasRemoteDescription = false;
     this._status = 'idle'; // idle | connecting | streaming | error
@@ -317,16 +328,16 @@ class AcoGoWebRtcCard extends HTMLElement {
     this.shadowRoot.getElementById('overlayIdle').style.display = 'none';
     this.shadowRoot.getElementById('overlayConnecting').style.display = 'flex';
 
-    // 20-second watchdog fail-safe
+    // 30-second watchdog fail-safe (allows cellular LTE modem time to warm up)
     clearTimeout(this._connectTimeout);
     this._connectTimeout = setTimeout(() => {
       if (this._status === 'connecting') {
-        console.warn('[acoGO WebRTC] Connection timeout reached (20s)');
+        console.warn('[acoGO WebRTC] Connection timeout reached (30s)');
         this._updateStatus('error', 'ТАЙМАУТ');
-        alert('Таймаут подключения (20с): вызывная панель не передала видеопоток. Линия освобождена.');
+        alert('Таймаут подключения (30с): вызывная панель не ответила на видео-вызов. Линия освобождена.');
         this._stopStream();
       }
-    }, 20000);
+    }, 30000);
 
     try {
       const resp = await this._hass.callWS({
@@ -348,6 +359,7 @@ class AcoGoWebRtcCard extends HTMLElement {
     } catch (err) {
       console.error('[acoGO WebRTC Card] Error starting stream:', err);
       clearTimeout(this._connectTimeout);
+      clearInterval(this._waitInterval);
       this._updateStatus('error', 'ОШИБКА');
       this.shadowRoot.getElementById('overlayConnecting').style.display = 'none';
       this.shadowRoot.getElementById('overlayIdle').style.display = 'flex';
@@ -378,7 +390,6 @@ class AcoGoWebRtcCard extends HTMLElement {
       this._dataChannel = this._pc.createDataChannel(chName);
       this._dataChannel.onopen = () => {
         console.log('[acoGO WebRTC] DataChannel open, sending handshake');
-        this._updateConnectingStep('[2/3] Обмен SDP и ICE...', 'Канал данных открыт, рукопожатие...');
         try {
           this._dataChannel.send(JSON.stringify({ network: { type: 'wifi' } }));
         } catch (e) {}
@@ -420,6 +431,7 @@ class AcoGoWebRtcCard extends HTMLElement {
       video.style.display = 'block';
 
       clearTimeout(this._connectTimeout);
+      clearInterval(this._waitInterval);
       this.shadowRoot.getElementById('overlayConnecting').style.display = 'none';
       this.shadowRoot.getElementById('overlayIdle').style.display = 'none';
       this._updateStatus('streaming', 'ПРЯМОЙ ЭФИР');
@@ -436,7 +448,7 @@ class AcoGoWebRtcCard extends HTMLElement {
         };
         const msg = {
           action: 'ICE_CANDIDATE',
-          messagePayload: btoa(JSON.stringify(cand))
+          messagePayload: safeBtoa(cand)
         };
         this._ws.send(JSON.stringify(msg));
       }
@@ -444,9 +456,11 @@ class AcoGoWebRtcCard extends HTMLElement {
 
     this._pc.oniceconnectionstatechange = () => {
       console.log('[acoGO WebRTC] ICE connection state:', this._pc.iceConnectionState);
-      this._updateConnectingStep('[2/3] Обмен SDP и ICE...', `ICE: ${this._pc.iceConnectionState}`);
-      if (this._pc.iceConnectionState === 'failed') {
+      if (this._pc.iceConnectionState === 'connected' || this._pc.iceConnectionState === 'completed') {
+        this._updateConnectingStep('[2/3] Обмен SDP и ICE...', 'ICE соединение установлено');
+      } else if (this._pc.iceConnectionState === 'failed') {
         clearTimeout(this._connectTimeout);
+        clearInterval(this._waitInterval);
         this._updateStatus('error', 'СБОЙ P2P');
         alert('Не удалось установить WebRTC P2P соединение с домофоном (ICE failed)');
         this._stopStream();
@@ -457,17 +471,27 @@ class AcoGoWebRtcCard extends HTMLElement {
 
     this._ws.onopen = async () => {
       console.log('[acoGO WebRTC] Signaling WebSocket open, creating offer...');
-      this._updateConnectingStep('[2/3] Обмен SDP и ICE...', 'WS подключен, отправка SDP Offer...');
+      this._updateConnectingStep('[2/3] Обмен SDP и ICE...', 'WS подключен, создание SDP Offer...');
       const offer = await this._pc.createOffer();
       await this._pc.setLocalDescription(offer);
 
-      this._updateConnectingStep('[2/3] Обмен SDP и ICE...', 'SDP Offer отправлен, ожидание домофона...');
+      this._waitingSeconds = 0;
+      this._updateConnectingStep('[2/3] Обмен SDP и ICE...', 'SDP Offer отправлен, ожидание домофона (0с / 30с)...');
+
+      clearInterval(this._waitInterval);
+      this._waitInterval = setInterval(() => {
+        this._waitingSeconds++;
+        if (this._status === 'connecting') {
+          this._updateConnectingStep('[2/3] Обмен SDP и ICE...', `SDP Offer отправлен, ожидание домофона (${this._waitingSeconds}с / 30с)...`);
+        }
+      }, 1000);
+
       const msg = {
         action: 'SDP_OFFER',
-        messagePayload: btoa(JSON.stringify({
+        messagePayload: safeBtoa({
           type: this._pc.localDescription.type,
           sdp: this._pc.localDescription.sdp
-        }))
+        })
       };
       this._ws.send(JSON.stringify(msg));
     };
@@ -475,7 +499,10 @@ class AcoGoWebRtcCard extends HTMLElement {
     this._ws.onmessage = async (evt) => {
       try {
         const msg = JSON.parse(evt.data);
+        console.log('[acoGO WebRTC] Received WS message type:', msg.messageType);
+
         if (msg.messageType === 'SDP_ANSWER') {
+          clearInterval(this._waitInterval);
           console.log('[acoGO WebRTC] Received SDP_ANSWER');
           this._updateConnectingStep('[2/3] Обмен SDP и ICE...', 'SDP Answer получен, согласование ICE...');
           const payload = JSON.parse(atob(msg.messagePayload));
@@ -505,6 +532,16 @@ class AcoGoWebRtcCard extends HTMLElement {
               }
             }
           }
+        } else if (msg.messageType === 'STATUS_RESPONSE' || msg.statusResponse) {
+          const st = msg.statusResponse || msg;
+          console.warn('[acoGO WebRTC] Status response from Kinesis:', st);
+          if (st.statusCode && st.statusCode >= 400) {
+            clearInterval(this._waitInterval);
+            clearTimeout(this._connectTimeout);
+            this._updateConnectingStep('[Ошибка]', `Kinesis: ${st.description || st.statusCode}`);
+            alert(`Ошибка AWS Kinesis Signaling: ${st.description || st.statusCode}`);
+            this._stopStream();
+          }
         }
       } catch (e) {
         console.warn('[acoGO WebRTC] Signaling parse error:', e);
@@ -513,11 +550,13 @@ class AcoGoWebRtcCard extends HTMLElement {
 
     this._ws.onerror = (err) => {
       console.error('[acoGO WebRTC] WebSocket error:', err);
+      clearInterval(this._waitInterval);
       this._updateConnectingStep('[Ошибка]', 'Ошибка WebSocket соединения с Kinesis');
     };
 
     this._ws.onclose = (evt) => {
       console.log('[acoGO WebRTC] Signaling WebSocket closed', evt.code, evt.reason);
+      clearInterval(this._waitInterval);
       if (this._status === 'connecting') {
         this._updateConnectingStep('[Закрыт]', `WebSocket закрыт (${evt.code})`);
       }
@@ -543,6 +582,7 @@ class AcoGoWebRtcCard extends HTMLElement {
 
   _stopStream() {
     clearTimeout(this._connectTimeout);
+    clearInterval(this._waitInterval);
     clearInterval(this._countdownInterval);
     const bar = this.shadowRoot.getElementById('timerBar');
     if (bar) bar.style.width = '0%';
@@ -631,4 +671,4 @@ window.customCards.push({
   name: 'acoGO! Live WebRTC Camera',
   description: 'Прямой видеопоток 30 FPS с домофона acoGO через браузерный WebRTC'
 });
-console.info('%c ACOGO-WEBRTC-CARD %c v1.0.4 Loaded ', 'background:#0284c7;color:#fff;font-weight:bold;', 'background:#0d121c;color:#10b981;');
+console.info('%c ACOGO-WEBRTC-CARD %c v1.0.5 Loaded ', 'background:#0284c7;color:#fff;font-weight:bold;', 'background:#0d121c;color:#10b981;');
