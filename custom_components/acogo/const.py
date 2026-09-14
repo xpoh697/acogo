@@ -1,7 +1,7 @@
 """Constants for the acoGO integration."""
 
 DOMAIN = "acogo"
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 
 BASE_URL = "https://api.aco.com.pl/listener/v1"
 

@@ -1,6 +1,7 @@
 /**
- * acoGO! Live WebRTC Camera Card for Home Assistant Lovelace
- * Direct browser-native WebRTC streaming from ACO GO! 2.0 intercoms via AWS Kinesis Video Streams.
+ * acoGO! Live WebRTC Lovelace Card
+ * Directly connects to AWS Kinesis Video Streams WebRTC for ultra-low latency intercom video feed.
+ * Version: 1.0.3
  */
 
 class AcoGoWebRtcCard extends HTMLElement {
@@ -9,10 +10,13 @@ class AcoGoWebRtcCard extends HTMLElement {
     this.attachShadow({ mode: 'open' });
     this._pc = null;
     this._ws = null;
-    this._streamTimer = null;
+    this._dataChannel = null;
     this._countdown = 0;
     this._countdownInterval = null;
-    this._status = 'idle'; // 'idle', 'connecting', 'streaming', 'error'
+    this._connectTimeout = null;
+    this._pendingIceCandidates = [];
+    this._hasRemoteDescription = false;
+    this._status = 'idle'; // idle | connecting | streaming | error
     this._statusText = 'ГОТОВ К ТРАНСЛЯЦИИ';
   }
 
@@ -30,7 +34,6 @@ class AcoGoWebRtcCard extends HTMLElement {
   setConfig(config) {
     this._config = {
       title: 'acoGO! Intercom',
-      device_id: '',
       door_entity: '',
       gate_entity: '',
       ...config
@@ -66,61 +69,51 @@ class AcoGoWebRtcCard extends HTMLElement {
   }
 
   _render() {
-    if (!this.shadowRoot) return;
-
     this.shadowRoot.innerHTML = `
       <style>
-        :host {
-          display: block;
-        }
         ha-card {
-          background: #121826;
-          border-radius: 16px;
           overflow: hidden;
-          box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
-          color: #ffffff;
+          background: #0d121c;
+          border-radius: 14px;
+          border: 1px solid rgba(255, 255, 255, 0.1);
+          box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
           font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+          color: #f8fafc;
         }
         .header {
+          padding: 14px 18px;
           display: flex;
           justify-content: space-between;
           align-items: center;
-          padding: 16px 20px;
-          background: #0d121c;
-          border-bottom: 1px solid #1f293d;
+          border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+          background: rgba(255, 255, 255, 0.02);
         }
         .title {
           font-size: 16px;
           font-weight: 600;
-          letter-spacing: 0.5px;
-          color: #e2e8f0;
           display: flex;
           align-items: center;
-          gap: 8px;
+          gap: 10px;
+          color: #f1f5f9;
         }
         .badge {
-          font-size: 12px;
-          font-weight: 600;
+          font-size: 11px;
           padding: 4px 10px;
-          border-radius: 12px;
+          border-radius: 20px;
+          font-weight: 600;
           text-transform: uppercase;
+          letter-spacing: 0.5px;
         }
-        .badge-idle { background: #1e293b; color: #94a3b8; }
-        .badge-connecting { background: #78350f; color: #f59e0b; animation: pulse 1.5s infinite; }
-        .badge-streaming { background: #064e3b; color: #10b981; }
-        .badge-error { background: #7f1d1d; color: #ef4444; }
-
-        @keyframes pulse {
-          0% { opacity: 0.6; }
-          50% { opacity: 1; }
-          100% { opacity: 0.6; }
-        }
+        .badge-idle { background: rgba(148, 163, 184, 0.2); color: #cbd5e1; }
+        .badge-connecting { background: rgba(245, 158, 11, 0.2); color: #f59e0b; }
+        .badge-streaming { background: rgba(16, 185, 129, 0.2); color: #10b981; }
+        .badge-error { background: rgba(239, 68, 68, 0.2); color: #ef4444; }
 
         .video-container {
           position: relative;
           width: 100%;
           aspect-ratio: 16 / 9;
-          background: #090d16;
+          background: #020617;
           display: flex;
           align-items: center;
           justify-content: center;
@@ -129,16 +122,18 @@ class AcoGoWebRtcCard extends HTMLElement {
         video {
           width: 100%;
           height: 100%;
-          object-fit: contain;
+          object-fit: cover;
           display: none;
+          background: #000;
         }
         .overlay-idle, .overlay-connecting {
+          position: absolute;
+          inset: 0;
           display: flex;
           flex-direction: column;
           align-items: center;
           justify-content: center;
-          gap: 16px;
-          color: #94a3b8;
+          gap: 12px;
           text-align: center;
           padding: 20px;
         }
@@ -150,22 +145,23 @@ class AcoGoWebRtcCard extends HTMLElement {
           display: flex;
           align-items: center;
           justify-content: center;
-          background: radial-gradient(circle, #00d2ff 0%, #1c263a 70%);
-          box-shadow: 0 0 20px rgba(0, 210, 255, 0.3);
+          background: radial-gradient(circle, #0284c7 0%, #0369a1 45%, #082f49 100%);
+          box-shadow: 0 0 25px rgba(0, 210, 255, 0.35);
         }
         .start-btn {
           background: #0284c7;
-          color: #ffffff;
+          color: #fff;
           border: none;
-          padding: 10px 24px;
-          font-size: 15px;
-          font-weight: 600;
+          padding: 10px 22px;
           border-radius: 8px;
+          font-size: 14px;
+          font-weight: 600;
           cursor: pointer;
-          transition: background 0.2s, transform 0.1s;
           display: flex;
           align-items: center;
           gap: 8px;
+          transition: background 0.2s, transform 0.1s;
+          box-shadow: 0 4px 12px rgba(2, 132, 199, 0.4);
         }
         .start-btn:hover { background: #0369a1; }
         .start-btn:active { transform: scale(0.98); }
@@ -174,25 +170,24 @@ class AcoGoWebRtcCard extends HTMLElement {
           width: 44px;
           height: 44px;
           border: 4px solid rgba(255, 255, 255, 0.1);
-          border-top: 4px solid #f59e0b;
+          border-top-color: #f59e0b;
           border-radius: 50%;
           animation: spin 1s linear infinite;
         }
         @keyframes spin {
-          0% { transform: rotate(0deg); }
-          100% { transform: rotate(360deg); }
+          to { transform: rotate(360deg); }
         }
 
         .controls {
+          padding: 14px 18px;
           display: grid;
           grid-template-columns: 1fr 1fr 1fr;
           gap: 10px;
-          padding: 16px;
-          background: #0d121c;
-          border-top: 1px solid #1f293d;
+          background: rgba(255, 255, 255, 0.02);
+          border-top: 1px solid rgba(255, 255, 255, 0.08);
         }
         .btn {
-          padding: 10px 14px;
+          padding: 11px 14px;
           border: none;
           border-radius: 8px;
           font-size: 13px;
@@ -234,7 +229,7 @@ class AcoGoWebRtcCard extends HTMLElement {
         <div class="timer-bar" id="timerBar"></div>
 
         <div class="video-container">
-          <video id="videoPlayer" autoplay playsinline controls></video>
+          <video id="videoPlayer" autoplay playsinline muted></video>
 
           <div id="overlayIdle" class="overlay-idle">
             <div class="lens-graphic">
@@ -255,8 +250,8 @@ class AcoGoWebRtcCard extends HTMLElement {
 
           <div id="overlayConnecting" class="overlay-connecting" style="display: none;">
             <div class="spinner"></div>
-            <div style="font-size: 14px; font-weight: 500; color: #f59e0b;">Установка защищенного P2P WebRTC соединения...</div>
-            <div style="font-size: 12px; color: #94a3b8;">Согласование H.264 видеопотока с домофоном</div>
+            <div id="connectingStepTitle" style="font-size: 14px; font-weight: 500; color: #f59e0b;">[1/3] Запрос сессии облака...</div>
+            <div id="connectingStepDetail" style="font-size: 12px; color: #94a3b8;">Инициализация WebRTC Kinesis...</div>
           </div>
         </div>
 
@@ -306,12 +301,32 @@ class AcoGoWebRtcCard extends HTMLElement {
     }
   }
 
+  _updateConnectingStep(title, detail) {
+    const root = this.shadowRoot;
+    const titleEl = root.getElementById('connectingStepTitle');
+    const detailEl = root.getElementById('connectingStepDetail');
+    if (titleEl) titleEl.textContent = title;
+    if (detailEl) detailEl.textContent = detail;
+  }
+
   async _startStream() {
     if (this._status === 'connecting' || this._status === 'streaming') return;
 
     this._updateStatus('connecting', 'ПОДКЛЮЧЕНИЕ...');
+    this._updateConnectingStep('[1/3] Запрос сессии облака...', 'Получение AWS Kinesis параметров...');
     this.shadowRoot.getElementById('overlayIdle').style.display = 'none';
     this.shadowRoot.getElementById('overlayConnecting').style.display = 'flex';
+
+    // 20-second watchdog fail-safe
+    clearTimeout(this._connectTimeout);
+    this._connectTimeout = setTimeout(() => {
+      if (this._status === 'connecting') {
+        console.warn('[acoGO WebRTC] Connection timeout reached (20s)');
+        this._updateStatus('error', 'ТАЙМАУТ');
+        alert('Таймаут подключения (20с): вызывная панель не передала видеопоток. Линия освобождена.');
+        this._stopStream();
+      }
+    }, 20000);
 
     try {
       const resp = await this._hass.callWS({
@@ -332,6 +347,7 @@ class AcoGoWebRtcCard extends HTMLElement {
       await this._connectWebRtc(data);
     } catch (err) {
       console.error('[acoGO WebRTC Card] Error starting stream:', err);
+      clearTimeout(this._connectTimeout);
       this._updateStatus('error', 'ОШИБКА');
       this.shadowRoot.getElementById('overlayConnecting').style.display = 'none';
       this.shadowRoot.getElementById('overlayIdle').style.display = 'flex';
@@ -341,29 +357,70 @@ class AcoGoWebRtcCard extends HTMLElement {
   }
 
   async _connectWebRtc(data) {
-    const { wss_url, ice_servers, timeout } = data;
+    const { wss_url, ice_servers, channel_name, timeout } = data;
     const video = this.shadowRoot.getElementById('videoPlayer');
+
+    this._updateConnectingStep('[2/3] Обмен SDP и ICE...', 'Подключение к AWS Kinesis Signaling Channel');
+
+    this._pendingIceCandidates = [];
+    this._hasRemoteDescription = false;
 
     this._pc = new RTCPeerConnection({
       iceServers: ice_servers || []
     });
 
-    this._pc.addTransceiver('video', { direction: 'recvonly' });
-    this._pc.addTransceiver('audio', { direction: 'recvonly' });
+    // Create DataChannel matching official acoGO Android/iOS app
+    const chName = channel_name || `aco_${data.device_id}`;
+    try {
+      this._dataChannel = this._pc.createDataChannel(chName);
+      this._dataChannel.onopen = () => {
+        console.log('[acoGO WebRTC] DataChannel open, sending handshake');
+        try {
+          this._dataChannel.send(JSON.stringify({ network: { type: 'wifi' } }));
+        } catch (e) {}
+      };
+      this._dataChannel.onmessage = (evt) => {
+        console.log('[acoGO WebRTC] Message from master:', evt.data);
+      };
+    } catch (e) {
+      console.warn('[acoGO WebRTC] DataChannel init error:', e);
+    }
+
+    this._pc.ondatachannel = (evt) => {
+      const channel = evt.channel;
+      channel.onopen = () => {
+        try {
+          channel.send(JSON.stringify({ network: { type: 'wifi' } }));
+        } catch (e) {}
+      };
+      channel.onmessage = (msg) => {
+        console.log('[acoGO WebRTC] Master channel message:', msg.data);
+      };
+    };
 
     this._pc.ontrack = (event) => {
       console.log('[acoGO WebRTC] Received remote track:', event.track.kind);
+      this._updateConnectingStep('[3/3] Запуск видеопотока H.264...', 'Буферизация видеокадров');
+
       if (event.streams && event.streams[0]) {
         video.srcObject = event.streams[0];
-        video.style.display = 'block';
-        this.shadowRoot.getElementById('overlayConnecting').style.display = 'none';
-        this.shadowRoot.getElementById('overlayIdle').style.display = 'none';
-        this._updateStatus('streaming', 'ПРЯМОЙ ЭФИР');
-        this._startCountdown(timeout || 45);
+      } else {
+        if (!video.srcObject) {
+          video.srcObject = new MediaStream();
+        }
+        video.srcObject.addTrack(event.track);
       }
-    };
 
-    this._ws = new WebSocket(wss_url);
+      video.muted = true;
+      video.play().catch(e => console.warn('[acoGO WebRTC] Video play error:', e));
+      video.style.display = 'block';
+
+      clearTimeout(this._connectTimeout);
+      this.shadowRoot.getElementById('overlayConnecting').style.display = 'none';
+      this.shadowRoot.getElementById('overlayIdle').style.display = 'none';
+      this._updateStatus('streaming', 'ПРЯМОЙ ЭФИР');
+      this._startCountdown(timeout || 45);
+    };
 
     this._pc.onicecandidate = (event) => {
       if (event.candidate && this._ws && this._ws.readyState === WebSocket.OPEN) {
@@ -375,9 +432,24 @@ class AcoGoWebRtcCard extends HTMLElement {
       }
     };
 
+    this._pc.oniceconnectionstatechange = () => {
+      console.log('[acoGO WebRTC] ICE connection state:', this._pc.iceConnectionState);
+      if (this._pc.iceConnectionState === 'failed') {
+        clearTimeout(this._connectTimeout);
+        this._updateStatus('error', 'СБОЙ P2P');
+        alert('Не удалось установить WebRTC P2P соединение с домофоном (ICE failed)');
+        this._stopStream();
+      }
+    };
+
+    this._ws = new WebSocket(wss_url);
+
     this._ws.onopen = async () => {
       console.log('[acoGO WebRTC] Signaling WebSocket open, creating offer...');
-      const offer = await this._pc.createOffer();
+      const offer = await this._pc.createOffer({
+        offerToReceiveVideo: true,
+        offerToReceiveAudio: false
+      });
       await this._pc.setLocalDescription(offer);
 
       const msg = {
@@ -394,12 +466,33 @@ class AcoGoWebRtcCard extends HTMLElement {
       try {
         const msg = JSON.parse(evt.data);
         if (msg.messageType === 'SDP_ANSWER') {
+          console.log('[acoGO WebRTC] Received SDP_ANSWER');
           const payload = JSON.parse(atob(msg.messagePayload));
           await this._pc.setRemoteDescription(new RTCSessionDescription(payload));
+          this._hasRemoteDescription = true;
+
+          // Flush queued candidates safely
+          console.log(`[acoGO WebRTC] Flushing ${this._pendingIceCandidates.length} pending ICE candidates`);
+          for (const cand of this._pendingIceCandidates) {
+            try {
+              await this._pc.addIceCandidate(new RTCIceCandidate(cand));
+            } catch (err) {
+              console.warn('[acoGO WebRTC] Error adding queued ICE candidate:', err);
+            }
+          }
+          this._pendingIceCandidates = [];
         } else if (msg.messageType === 'ICE_CANDIDATE') {
           const payload = JSON.parse(atob(msg.messagePayload));
-          if (payload.candidate) {
-            await this._pc.addIceCandidate(new RTCIceCandidate(payload));
+          if (payload && (payload.candidate || payload.candidate === '')) {
+            if (!this._hasRemoteDescription) {
+              this._pendingIceCandidates.push(payload);
+            } else {
+              try {
+                await this._pc.addIceCandidate(new RTCIceCandidate(payload));
+              } catch (err) {
+                console.warn('[acoGO WebRTC] Error adding ICE candidate:', err);
+              }
+            }
           }
         }
       } catch (e) {
@@ -434,10 +527,15 @@ class AcoGoWebRtcCard extends HTMLElement {
   }
 
   _stopStream() {
+    clearTimeout(this._connectTimeout);
     clearInterval(this._countdownInterval);
     const bar = this.shadowRoot.getElementById('timerBar');
     if (bar) bar.style.width = '0%';
 
+    if (this._dataChannel) {
+      try { this._dataChannel.close(); } catch (e) {}
+      this._dataChannel = null;
+    }
     if (this._pc) {
       try { this._pc.close(); } catch (e) {}
       this._pc = null;
@@ -460,7 +558,7 @@ class AcoGoWebRtcCard extends HTMLElement {
 
     this._updateStatus('idle', 'ГОТОВ К ТРАНСЛЯЦИИ');
 
-    // Notify backend to close session
+    // Notify backend to close session and release intercom line
     if (this._hass) {
       this._hass.callService('acogo', 'stop_webrtc_stream', {
         device_id: this._config.device_id
@@ -481,11 +579,10 @@ class AcoGoWebRtcCard extends HTMLElement {
     const ctx = canvas.getContext('2d');
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-    const dataUrl = canvas.toDataURL('image/jpeg', 0.95);
-    const link = document.createElement('a');
-    link.href = dataUrl;
-    link.download = `acogo_snapshot_${new Date().toISOString().replace(/[:.]/g, '-')}.jpg`;
-    link.click();
+    const a = document.createElement('a');
+    a.href = canvas.toDataURL('image/jpeg', 0.95);
+    a.download = `acogo_snapshot_${Date.now()}.jpg`;
+    a.click();
   }
 
   _unlockDoor() {
@@ -519,4 +616,4 @@ window.customCards.push({
   name: 'acoGO! Live WebRTC Camera',
   description: 'Прямой видеопоток 30 FPS с домофона acoGO через браузерный WebRTC'
 });
-console.info('%c ACOGO-WEBRTC-CARD %c v1.0.2 Loaded ', 'background:#0284c7;color:#fff;font-weight:bold;', 'background:#0d121c;color:#10b981;');
+console.info('%c ACOGO-WEBRTC-CARD %c v1.0.3 Loaded ', 'background:#0284c7;color:#fff;font-weight:bold;', 'background:#0d121c;color:#10b981;');

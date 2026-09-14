@@ -200,10 +200,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 item["credential"] = s.credential
             ice_list.append(item)
 
+        channel_name = aws.get("channel name") or aws.get("channelName", "") or aws.get("channel_name", "")
+
         return {
             "wss_url": wss_url,
             "ice_servers": ice_list,
             "device_id": device_id,
+            "channel_name": channel_name,
             "timeout": 45,
         }
 
