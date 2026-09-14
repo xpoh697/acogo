@@ -10,7 +10,9 @@ import io
 import ipaddress
 import json
 import logging
+import os
 import re
+import unicodedata
 import urllib.parse
 from typing import Any
 
@@ -171,6 +173,22 @@ def filter_private_candidates(sdp: str) -> str:
     return "\r\n".join(clean_lines) + "\r\n"
 
 
+def _clean_ascii(text: str) -> str:
+    """Normalize and convert text to clean printable ASCII (e.g. Julianów -> Julianow)."""
+    norm = unicodedata.normalize("NFKD", text)
+    clean = norm.encode("ascii", "ignore").decode("ascii")
+    return "".join(c for c in clean if 32 <= ord(c) < 127).strip()
+
+
+def _get_text_width(draw: Any, text: str, font: Any) -> int:
+    """Safely calculate text width in pixels across different Pillow versions."""
+    try:
+        bbox = draw.textbbox((0, 0), text, font=font)
+        return bbox[2] - bbox[0]
+    except Exception:
+        return len(text) * 14
+
+
 def generate_snapshot_fallback_card(panel_name: str) -> bytes:
     """Generate an informative JPEG card when direct WebRTC frame capture is buffering."""
     try:
@@ -180,32 +198,71 @@ def generate_snapshot_fallback_card(panel_name: str) -> bytes:
         img = Image.new("RGB", (width, height), color=(15, 23, 42))
         draw = ImageDraw.Draw(img)
 
-        try:
-            font_title = ImageFont.load_default(size=26)
-            font_big = ImageFont.load_default(size=36)
-            font_sub = ImageFont.load_default(size=22)
-            font_small = ImageFont.load_default(size=18)
-        except Exception:
-            font_title = font_big = font_sub = font_small = ImageFont.load_default()
+        # Multi-level font discovery with Unicode support
+        candidate_font_paths = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "C:/Windows/Fonts/arialbd.ttf",
+            "C:/Windows/Fonts/arial.ttf",
+            "arial.ttf",
+        ]
+
+        has_unicode_font = False
+        font_title = font_big = font_sub = font_small = None
+
+        for p in candidate_font_paths:
+            if os.path.exists(p):
+                try:
+                    font_title = ImageFont.truetype(p, 26)
+                    font_big = ImageFont.truetype(p, 36)
+                    font_sub = ImageFont.truetype(p, 22)
+                    font_small = ImageFont.truetype(p, 18)
+                    has_unicode_font = True
+                    break
+                except Exception:
+                    continue
+
+        if not has_unicode_font:
+            try:
+                font_title = ImageFont.load_default(size=26)
+                font_big = ImageFont.load_default(size=36)
+                font_sub = ImageFont.load_default(size=22)
+                font_small = ImageFont.load_default(size=18)
+            except Exception:
+                font_title = font_big = font_sub = font_small = ImageFont.load_default()
+
+        # Clean panel name to prevent tofu in header
+        clean_panel = _clean_ascii(panel_name).upper() or "ACOGO"
 
         # Header bar
         draw.rectangle([0, 0, width, 68], fill=(10, 15, 28))
-        draw.text((32, 22), f"ACO INTERCOM - {panel_name.upper()}", fill=(255, 255, 255), font=font_title)
+        draw.text((32, 22), f"ACO INTERCOM - {clean_panel}", fill=(255, 255, 255), font=font_title)
         now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         draw.text((width - 260, 22), now_str, fill=(148, 163, 184), font=font_title)
 
-        # Central icon
+        # Central lens graphic
         cx, cy = width // 2, height // 2 - 20
         draw.ellipse([cx - 100, cy - 100, cx + 100, cy + 100], fill=(30, 41, 59), outline=(2, 132, 199), width=3)
         draw.ellipse([cx - 60, cy - 60, cx + 60, cy + 60], fill=(15, 23, 42), outline=(245, 158, 11), width=2)
         draw.ellipse([cx - 20, cy - 20, cx + 20, cy + 20], fill=(245, 158, 11))
 
-        # Status text
-        status_text = "ВХОДЯЩИЙ ЗВОНОК В ДОМОФОН"
-        draw.text((cx - 280, cy + 130), status_text, fill=(245, 158, 11), font=font_big)
+        # Status text (Cyrillic if TTF exists, crystal-clear Latin if default font)
+        if has_unicode_font:
+            status_text = "ВХОДЯЩИЙ ЗВОНОК В ДОМОФОН"
+            sub_text = "Откройте карточку в Home Assistant для просмотра видео 30 FPS"
+        else:
+            status_text = "INCOMING DOORBELL CALL"
+            sub_text = "Open Home Assistant dashboard for live 30 FPS WebRTC video"
 
-        sub_text = "Нажмите 'Включить камеру' на карточке в Home Assistant для просмотра живого видео 30 FPS"
-        draw.text((cx - 420, cy + 180), sub_text, fill=(148, 163, 184), font=font_sub)
+        tw = _get_text_width(draw, status_text, font_big)
+        draw.text((cx - tw // 2, cy + 120), status_text, fill=(245, 158, 11), font=font_big)
+
+        tw_sub = _get_text_width(draw, sub_text, font_sub)
+        draw.text((cx - tw_sub // 2, cy + 175), sub_text, fill=(148, 163, 184), font=font_sub)
 
         # Footer bar
         draw.rectangle([0, height - 50, width, height], fill=(10, 15, 28))
@@ -224,7 +281,7 @@ def generate_snapshot_fallback_card(panel_name: str) -> bytes:
 async def async_capture_webrtc_snapshot(
     session: Any,
     aws: dict[str, Any],
-    timeout: float = 6.0,
+    timeout: float = 10.0,
 ) -> bytes | None:
     """Connect as WebRTC viewer to AWS KVS, receive 1 video frame, and return JPEG bytes."""
     try:

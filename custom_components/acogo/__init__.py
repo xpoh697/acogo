@@ -252,7 +252,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             raise HomeAssistantError("Intercom device not found")
 
         raw_filename = call.data.get("filename", "/config/www/doorbell_latest.jpg")
-        timeout = float(call.data.get("timeout", 5.0))
+        timeout = float(call.data.get("timeout", 10.0))
 
         # Safe directory path resolution
         if hass.config.is_allowed_path(raw_filename):
