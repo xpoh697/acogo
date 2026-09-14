@@ -1,8 +1,8 @@
 # acoGO! 2.0 — Home Assistant Integration
 
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg?style=for-the-badge)](https://github.com/hacs/integration)
-[![GitHub Release](https://img.shields.io/github/v/release/aco-ha/acogo?style=for-the-badge)](https://github.com/aco-ha/acogo/releases)
-[![License](https://img.shields.io/github/license/aco-ha/acogo?style=for-the-badge)](LICENSE)
+[![GitHub Release](https://img.shields.io/github/v/release/xpoh697/acogo?style=for-the-badge)](https://github.com/xpoh697/acogo/releases)
+[![License](https://img.shields.io/github/license/xpoh697/acogo?style=for-the-badge)](LICENSE)
 
 <p align="center">
   <img src="icon.png" width="180" height="180" alt="acoGO! Home Assistant Integration">
@@ -10,20 +10,20 @@
 
 Интеграция для систем умных домофонов и модулей **ACO (acoGO! 2.0)** в **Home Assistant**.
 
-Разработано на основе полного реверс-инжиниринга официального мобильного приложения `pl.aco.acogo` (v1.9.0) и облачного API `api.aco.com.pl`.
+Разработано на основе полного реверс-инжиниринга официального мобильного приложения `pl.aco.acogo` (v1.9.0), облачного API `api.aco.com.pl` и прямого взаимодействия с AWS Kinesis Video Streams WebRTC.
 
 ---
 
 ## Возможности
 
-- 🚪 **Управление дверью (Замок 1)**: Надежное импульсное открытие основного электрозамка / калитки (`ezOpen`).
-- 🚧 **Управление воротами (Замок 2 / F2)**: Открытие въездных ворот или шлагбаума через функцию F2 (`f2Open`).
+- 🚪 **Управление дверью (калитка)**: Надежное импульсное открытие электрозамка (`f2Open`).
+- 🚗 **Управление въездными воротами**: Открытие въездных ворот или шлагбаума (`ezOpen`).
 - 🛡️ **Защита физической линии домофона**: Реализована безопасная последовательность перехвата и освобождения линии (`receiveCall` ➔ задержка ➔ `open` ➔ `endCall`) с защитой от состояния гонки через `asyncio.Lock` для каждого устройства.
-- 📹 **Переключение видеокамер**: Кнопка циклического переключения видеовходов вызывной панели (`video-sw`).
-- 🔔 **Детекция звонков**: Бинарный сенсор входящего вызова (`busy` / `ready`) для мгновенного запуска автоматизаций Home Assistant (оповещения на телефон, умные колонки, подсветка).
+- 🔔 **Детекция звонков**: Мгновенный бинарный сенсор входящего вызова (`binary_sensor.*_incoming_call_line_active`) для запуска автоматизаций (оповещения в Telegram, умные колонки, подсветка).
 - 📶 **Мониторинг состояния**: Сенсор доступности панели (Online / Offline), версии ПО и прошивки.
-- 📷 **Камера вызывной панели**: Поддержка видеопотока и захвата кадров через AWS Kinesis Video Streams WebRTC с автоматическим закрытием сессии при неактивности (защита от исчерпания облачных квот).
-- ⚙️ **Удобная настройка через UI**: Авторизация по учетным данным портала myAco / acoGO с автоматической генерацией сессии устройства.
+- 📺 **Живое WebRTC видео (Lovelace Card)**: Встроенная кастомная карточка `acogo-webrtc-card` с прямой P2P-трансляцией 30 FPS через браузерный стек AWS Kinesis Video Streams с околонулевой задержкой, кнопками управления калиткой/воротами и бейджами статуса.
+- 📸 **Сервис создания снимков**: Специализированная служба `acogo.capture_snapshot` для автоматизаций Home Assistant (захват WebRTC-кадра напрямую в `/config/www/` с отказоустойчивой fallback-карточкой при задержках сотовой связи).
+- ⚙️ **Удобная настройка через UI**: Авторизация по учетным данным портала myAco / acoGO с автоматической регистрацией защищенной сессии устройства.
 
 ---
 
@@ -34,7 +34,7 @@
 1. Убедитесь, что у вас установлен [HACS](https://hacs.xyz/).
 2. В интерфейсе Home Assistant перейдите в **HACS** ➔ **Интеграции**.
 3. В правом верхнем углу нажмите меню с тремя точками ➔ **Пользовательские репозитории** (Custom repositories).
-4. Добавьте URL вашего репозитория, выберите категорию **Интеграция** (Integration) и нажмите **Добавить**.
+4. Добавьте URL репозитория `https://github.com/xpoh697/acogo`, выберите категорию **Интеграция** (Integration) и нажмите **Добавить**.
 5. Найдите в поиске **acoGO! Intercom** и нажмите **Загрузить** (Download).
 6. Перезагрузите Home Assistant.
 
@@ -46,14 +46,14 @@
 
 ---
 
-## Настройка
+## Настройка интеграции
 
 1. В Home Assistant перейдите в **Настройки** ➔ **Устройства и службы** ➔ **Добавить интеграцию**.
 2. Введите в поиске **acoGO! Intercom**.
 3. В диалоговом окне укажите:
    - **Email / Имя пользователя** от аккаунта acoGO! / myAco.
    - **Пароль**.
-4. Нажмите **Отправить**. Интеграция автоматически зарегистрирует защищенную сессию устройства в облаке ACO и добавит все обнаруженные панели домофонов и модули.
+4. Нажмите **Отправить**. Интеграция автоматически зарегистрирует защищенную сессию устройства в облаке ACO и создаст все сущности для обнаруженных вызывных панелей.
 
 ---
 
@@ -61,56 +61,102 @@
 
 Для каждой вызывной панели создаются следующие сущности:
 
-| Домен | Имя | Описание |
+| Домен | Сущность | Описание |
 |---|---|---|
-| `lock` | `Door Lock` | Основной электрозамок двери / калитки |
-| `lock` | `Gate (F2)` | Замок ворот / шлагбаума (функция F2) |
-| `button` | `Open Door` | Импульсная кнопка открытия двери |
+| `lock` | `Door Lock` | Замок двери / калитки |
+| `lock` | `Gate (F2)` | Замок ворот / шлагбаума |
+| `button` | `Open Door` | Импульсная кнопка открытия калитки |
 | `button` | `Open Gate` | Импульсная кнопка открытия ворот |
-| `button` | `Switch Camera Video Input` | Переключение видеовхода камеры |
 | `binary_sensor` | `Status` | Доступность панели в облаке (Online / Offline) |
-| `binary_sensor` | `Incoming Call / Line Active` | Индикатор входящего звонка / занятости линии |
-| `camera` | `Camera` | Камера вызывной панели (AWS KVS / WebRTC) |
+| `binary_sensor` | `Incoming Call / Line Active` | Индикатор входящего звонка / активности линии |
+
+> [!NOTE]
+> В версиях **1.0.9+** стандартная сущность `camera` была удалена. Физические панели acoGO! не имеют локального веб-сервера (JPEG/RTSP) и передают видео исключительно через AWS Kinesis Video Streams WebRTC. Для просмотра живого видеопотока используется кастомная карточка `acogo-webrtc-card`, а для автоматизаций — служба `acogo.capture_snapshot`.
+
+---
+
+## Карточка для дашборда (Lovelace Card)
+
+Интеграция поставляется со встроенной карточкой **`acogo-webrtc-card`**, обеспечивающей прямое воспроизведение живого видеоряда с вызывной панели.
+
+### Подключение ресурса Lovelace
+Ресурс регистрируется автоматически при запуске интеграции. Если вы настраиваете дашборды вручную через YAML или хотите обновить ресурс, укажите:
+- **URL**: `/api/acogo/static/acogo-webrtc-card.js?v=1.1.0`
+- **Тип**: `JavaScript модуль`
+
+### Пример конфигурации карточки:
+```yaml
+type: custom:acogo-webrtc-card
+title: Домофон (Калитка)
+camera_entity: binary_sensor.ulitsa_acogo_julianow_status
+door_button: button.ulitsa_acogo_julianow_open_door
+gate_button: button.ulitsa_acogo_julianow_open_gate
+call_sensor: binary_sensor.ulitsa_acogo_julianow_incoming_call_line_active
+```
+
+**Особенности карточки:**
+- Нативный плеер HTML5 WebRTC (30 FPS, аудио/видео).
+- Встроенные кнопки мгновенного импульсного открытия калитки и ворот.
+- Индикатор входящего звонка в реальном времени.
+- Автоматическое завершение WebRTC-сессии при уходе со страницы или закрытии карточки (защита от исчерпания облачных квот и освобождение домофонной линии).
+
+---
+
+## Службы (Services)
+
+Интеграция предоставляет набор специализированных служб:
+
+### `acogo.capture_snapshot`
+Делает снимок с вызывной панели домофона и сохраняет его на диск в каталог `/config/www/`.
+
+```yaml
+action: acogo.capture_snapshot
+data:
+  filename: /config/www/doorbell_snapshot.jpg
+  timeout: 10
+```
+
+- **`filename`** *(опционально)*: Полный путь к файлу. Рекомендуется сохранять в `/config/www/`, чтобы файл был доступен веб-серверу Home Assistant и Telegram-боту. По умолчанию: `/config/www/doorbell_snapshot.jpg`.
+- **`timeout`** *(опционально)*: Таймаут ожидания видеокадра WebRTC в секундах (по умолчанию `12`).
+- **Отказоустойчивость (Fail-Safe)**: Если сотовая связь домофона испытывает задержки и I-frame не получен в течение заданного таймаута, сервис автоматически генерирует информационную карточку 1280×720 со штампом времени звонка и именем панели. Ваш Telegram-бот **всегда получит валидное изображение** и не упадет с ошибкой "файл не найден".
+
+### `acogo.start_webrtc_stream`
+Инициирует сессию видеотрансляции вызывной панели в облаке ACO / AWS KVS.
+
+### `acogo.stop_webrtc_stream`
+Завершает активную сессию видеотрансляции и освобождает физическую линию домофона.
 
 ---
 
 ## Примеры автоматизаций
 
-> [!TIP]
-> **Синтаксис Home Assistant 2024+**: В примерах используется актуальный синтаксис `action:`. Если вы используете версию Home Assistant ниже 2024.8, замените `action:` на `service:`.
-
 ### 1. Отправка фото звонящего в Telegram с кнопками открытия
 
-При звонке в домофон автоматизация выдерживает паузу **3 секунды** (необходима физической матрице камеры домофона для разогрева оптического сенсора и формирования первого ключевого кадра H.264), делает снимок лица посетителя с уникальным таймстемпом и отправляет в Telegram с инлайн-кнопками мгновенного открытия:
+При звонке в домофон автоматизация вызывает службу `acogo.capture_snapshot` и отправляет полученный снимок в Telegram с инлайн-кнопками открытия двери и ворот:
 
 ```yaml
 - id: "acogo_doorbell_telegram_notify"
   alias: "Домофон: Фото звонящего в Telegram"
-  description: "При звонке в домофон делает снимок с камеры и отправляет в Telegram с кнопками открытия"
+  description: "При звонке в домофон делает снимок и отправляет в Telegram с кнопками открытия"
   triggers:
     - trigger: state
       entity_id:
-        - binary_sensor.aco_intercom_incoming_call_line_active  # Замените на entity_id вашей панели
-      to:
-        - "on"
+        - binary_sensor.ulitsa_acogo_julianow_incoming_call_line_active  # Замените на entity_id вашей панели
+      to: "on"
   mode: single
   actions:
-    # 1. Задержка 3 секунды для разогрева оптики домофона и генерации I-frame
-    - delay: "00:00:03"
-
-    # 2. Формируем уникальный путь файла (защита от кэширования в Telegram)
+    # 1. Формируем уникальный путь файла (защита от кэширования в Telegram)
     - variables:
         snapshot_file: >-
           /config/www/aco_bell_{{ now().strftime('%Y%m%d_%H%M%S') }}.jpg
 
-    # 3. Делаем снимок (захват реального WebRTC-кадра через интеграцию)
-    - action: camera.snapshot
-      target:
-        entity_id: camera.aco_intercom_camera  # Замените на entity_id вашей камеры
+    # 2. Захват снимка через WebRTC-сервис acogo
+    - action: acogo.capture_snapshot
       data:
         filename: "{{ snapshot_file }}"
+        timeout: 10
 
-    # 4. Отправляем фото в Telegram
+    # 3. Отправка фото в Telegram с кнопками
     - action: telegram_bot.send_photo
       data:
         file: "{{ snapshot_file }}"
@@ -123,8 +169,6 @@
 ---
 
 ### 2. Обработка нажатия кнопок в Telegram (с защитой по User ID)
-
-Нажатие кнопок под фото в Telegram мгновенно открывает дверь или ворота. В автоматизацию встроена проверка прав по `user_id` Telegram, исключающая несанкционированное открытие посторонними лицами.
 
 ```yaml
 - id: "acogo_telegram_action_handler"
@@ -141,35 +185,36 @@
       event_data:
         data: /aco_open_gate
       id: open_gate
-  # Защита: разрешено только доверенным Telegram User ID
   conditions:
+    # Защита: разрешено только доверенным Telegram User ID (опционально)
     - condition: template
       value_template: >-
-        {{ trigger.event.data.user_id in [123456789, 987654321] }} # Укажите ваши Telegram User ID
+        {{ trigger.event.data.user_id in [123456789, 987654321] }}
+      enabled: false
   actions:
     - choose:
-        # Открытие двери (Замок 1)
+        # Открытие двери (калитка)
         - conditions:
             - condition: trigger
               id: open_door
           sequence:
             - action: button.press
               target:
-                entity_id: button.aco_intercom_open_door  # Либо lock.unlock на lock.aco_intercom_door_lock
+                entity_id: button.ulitsa_acogo_julianow_open_door
             - action: telegram_bot.answer_callback_query
               data:
                 callback_query_id: "{{ trigger.event.data.id }}"
-                message: "✅ Дверь открывается!"
+                message: "✅ Дверь открыта!"
                 show_alert: false
 
-        # Открытие въездных ворот (Замок 2 / F2)
+        # Открытие въездных ворот
         - conditions:
             - condition: trigger
               id: open_gate
           sequence:
             - action: button.press
               target:
-                entity_id: button.aco_intercom_open_gate  # Либо lock.unlock на lock.aco_intercom_gate_f2
+                entity_id: button.ulitsa_acogo_julianow_open_gate
             - action: telegram_bot.answer_callback_query
               data:
                 callback_query_id: "{{ trigger.event.data.id }}"
@@ -182,7 +227,7 @@
 
 ### 3. Автоматическая очистка старых снимков звонков (Опционально)
 
-Чтобы накопитель Home Assistant не забивался архивными снимками посетителей, добавьте регулярную очистку файлов старше 7 дней раз в сутки:
+Чтобы накопитель Home Assistant не заполнялся архивными снимками, можно добавить автоматическую очистку файлов старше 7 дней:
 
 ```yaml
 - id: "acogo_cleanup_snapshots"
@@ -192,7 +237,7 @@
     - trigger: time
       at: "04:00:00"
   actions:
-    - action: shell_command.purge_old_aco_bell_photos  # Задайте в configuration.yaml: find /config/www -name 'aco_bell_*.jpg' -mtime +7 -delete
+    - action: shell_command.purge_old_aco_bell_photos  # В configuration.yaml: find /config/www -name 'aco_bell_*.jpg' -mtime +7 -delete
   mode: single
 ```
 
