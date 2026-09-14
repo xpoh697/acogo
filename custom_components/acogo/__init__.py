@@ -1,24 +1,31 @@
-"""The acoGO! integration."""
+"""The acoGO integration."""
 from __future__ import annotations
 
+import asyncio
+from datetime import timedelta
 import logging
 from pathlib import Path
+import time
 from typing import Any
-import uuid
 
-from aiohttp import web
-
-from homeassistant.components import frontend
-from homeassistant.components.http import HomeAssistantView
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, Platform
-from homeassistant.core import CoreState, HomeAssistant, ServiceCall, SupportsResponse
-from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import entity_registry as er
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, Platform
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
+from homeassistant.helpers import aiohttp_client
+from homeassistant.helpers.event import async_track_time_interval
 
-from .api import AcoGoApiClient
-from .const import CONF_DEV_ID, CONF_DEVICE_PASSWORD, CONF_PASSWORD, CONF_USERNAME, DOMAIN, VERSION
+from .api import AcoGoApiClient, AcoGoAuthError
+from .const import (
+    CONF_DEV_ID,
+    CONF_DEVICE_PASSWORD,
+    DOMAIN,
+    ORDER_END_CALL,
+    ORDER_EZ_OPEN,
+    ORDER_F2_OPEN,
+    ORDER_RECEIVE_CALL,
+    ORDER_REJECT_CALL,
+)
 from .coordinator import AcoGoDataUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -29,260 +36,153 @@ PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
 ]
 
-ALLOWED_STATIC_FILES = {"acogo-webrtc-card.js"}
-
-
-class CardStaticView(HomeAssistantView):
-    """View to serve static Lovelace card files with no-cache and CORS headers."""
-
-    url = f"/api/{DOMAIN}/static/{{filename}}"
-    name = f"api:{DOMAIN}:static"
-    requires_auth = False
-    cors_allowed = True
-
-    def __init__(self, www_path: Path) -> None:
-        """Initialize view with www path."""
-        self._www_path = www_path
-
-    async def get(self, request: web.Request, filename: str) -> web.Response:
-        """Handle GET request for static files."""
-        if filename not in ALLOWED_STATIC_FILES:
-            return web.Response(status=404)
-
-        file_path = self._www_path / filename
-        if not file_path.is_file():
-            return web.Response(status=404)
-
-        try:
-            return web.FileResponse(
-                file_path,
-                headers={"Cache-Control": "no-cache, no-store, must-revalidate, max-age=0"},
-            )
-        except Exception:
-            return web.Response(status=500)
-
-
-async def _async_register_card(hass: HomeAssistant) -> None:
-    """Register the Lovelace card with Lovelace resources and frontend."""
-    card_url = f"/api/{DOMAIN}/static/acogo-webrtc-card.js?v={VERSION}"
-
-    # 1. Direct injection into all dashboards immediately (works across all Lovelace modes)
-    try:
-        frontend.add_extra_js_url(hass, card_url)
-        _LOGGER.debug("Registered acoGO card via add_extra_js_url: %s", card_url)
-    except Exception as err:
-        _LOGGER.warning("Failed to register acoGO card via add_extra_js_url: %s", err)
-
-    # 2. Register in Lovelace storage resources
-    registered = await _async_register_lovelace_resource(hass, card_url)
-    if registered:
-        _LOGGER.info("Registered acoGO Lovelace resource: %s", card_url)
-
-
-async def _async_register_lovelace_resource(hass: HomeAssistant, url: str) -> bool:
-    """Create or update the Lovelace resource entry, cleaning up duplicates and legacy URLs."""
-    lovelace_data = hass.data.get("lovelace")
-    if lovelace_data is None:
-        return False
-
-    resources = getattr(lovelace_data, "resources", None)
-    if resources is None:
-        return False
-
-    if not hasattr(resources, "async_create_item") or not hasattr(resources, "async_update_item"):
-        return False
-
-    base_url = url.split("?")[0]
-    legacy_url = "/local/acogo-webrtc-card.js"
-    matched_items = []
-
-    try:
-        for item in resources.async_items():
-            existing_url = item.get("url") or ""
-            existing_base = existing_url.split("?")[0]
-            if existing_base in (base_url, legacy_url):
-                matched_items.append(item)
-    except Exception:
-        return False
-
-    try:
-        if matched_items:
-            first_item = matched_items[0]
-            if first_item.get("url") != url:
-                await resources.async_update_item(first_item["id"], {"res_type": "module", "url": url})
-                _LOGGER.info("Updated Lovelace resource to: %s", url)
-
-            if len(matched_items) > 1 and hasattr(resources, "async_delete_item"):
-                for dup in matched_items[1:]:
-                    await resources.async_delete_item(dup["id"])
-                    _LOGGER.info("Removed duplicate/legacy Lovelace resource: %s", dup.get("url"))
-        else:
-            await resources.async_create_item({"res_type": "module", "url": url})
-            _LOGGER.info("Created Lovelace resource: %s", url)
-        return True
-    except Exception as err:
-        _LOGGER.warning("Failed to register/update Lovelace resource: %s", err)
-        return False
-
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up acoGO! from a config entry."""
+    """Set up acoGO from a config entry."""
     hass.data.setdefault(DOMAIN, {})
 
-    # Register static HTTP view once per HA lifetime
-    if not hass.data[DOMAIN].get("_view_registered"):
-        if getattr(hass, "http", None) is not None:
-            www_path = Path(__file__).parent / "www"
-            hass.http.register_view(CardStaticView(www_path))
-        hass.data[DOMAIN]["_view_registered"] = True
+    dev_id: str = entry.data[CONF_DEV_ID]
+    device_password: str | None = entry.data.get(CONF_DEVICE_PASSWORD)
+    username: str = entry.data[CONF_USERNAME]
+    password: str = entry.data[CONF_PASSWORD]
 
-    # Register card automatically in Lovelace
-    if hass.state == CoreState.running:
-        hass.async_create_task(_async_register_card(hass))
-    else:
-        async def _register_card_after_start(event: Any) -> None:
-            await _async_register_card(hass)
+    session = aiohttp_client.async_get_clientsession(hass)
 
-        entry.async_on_unload(
-            hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _register_card_after_start)
-        )
+    def _on_password_updated(new_pwd: str) -> None:
+        """Update entry data if cloud rotated or newly generated devicePassword."""
+        new_data = {**entry.data, CONF_DEVICE_PASSWORD: new_pwd}
+        hass.config_entries.async_update_entry(entry, data=new_data)
+        _LOGGER.debug("Updated config entry with new devicePassword")
 
-    # Automatically clean up deprecated camera, switch, and preview button entities from entity registry
-    ent_reg = er.async_get(hass)
-    deprecated_entries = [
-        entity_entry.entity_id
-        for entity_entry in er.async_entries_for_config_entry(ent_reg, entry.entry_id)
-        if entity_entry.domain in ("camera", "switch")
-        or entity_entry.unique_id.endswith(("_start_preview", "_stop_preview", "_camera_preview_switch"))
-    ]
-    for entity_id in deprecated_entries:
-        ent_reg.async_remove(entity_id)
-        _LOGGER.info("Removed deprecated entity from registry: %s", entity_id)
-
-    session = async_get_clientsession(hass)
-
-    def _on_password_updated(new_password: str) -> None:
-        """Persist newly rotated devicePassword to ConfigEntry."""
-        _LOGGER.info("Persisting rotated acoGO devicePassword to ConfigEntry")
-        hass.config_entries.async_update_entry(
-            entry,
-            data={**entry.data, CONF_DEVICE_PASSWORD: new_password},
-        )
-
-    client = AcoGoApiClient(
+    api = AcoGoApiClient(
         session=session,
-        dev_id=entry.data[CONF_DEV_ID],
-        device_password=entry.data[CONF_DEVICE_PASSWORD],
-        username=entry.data.get(CONF_USERNAME),
-        password=entry.data.get(CONF_PASSWORD),
+        dev_id=dev_id,
+        device_password=device_password,
+        username=username,
+        password=password,
         on_device_password_updated=_on_password_updated,
     )
 
-    coordinator = AcoGoDataUpdateCoordinator(hass, client)
+    if not device_password:
+        try:
+            await api.register_device()
+        except AcoGoAuthError as err:
+            raise ConfigEntryNotReady(f"Failed to authenticate with acoGO Cloud: {err}") from err
+
+    coordinator = AcoGoDataUpdateCoordinator(hass, api)
     await coordinator.async_config_entry_first_refresh()
 
-    # Start high-frequency line monitor safely without blocking HA startup
-    if hass.state == CoreState.running:
-        coordinator.start_line_monitor()
-    else:
-        async def _start_line_monitor_after_ha_started(event: Any) -> None:
-            coordinator.start_line_monitor()
-
-        entry.async_on_unload(
-            hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _start_line_monitor_after_ha_started)
-        )
+    # Start high-frequency line state monitor for instant call detection
+    coordinator.start_line_monitor()
 
     hass.data[DOMAIN][entry.entry_id] = {
+        "api": api,
         "coordinator": coordinator,
-        "api": client,
     }
 
-    # Register WebRTC streaming services
-    async def async_handle_start_webrtc_stream(call: ServiceCall) -> dict[str, Any]:
-        """Initiate KVS session and return signed WebSocket and ICE configuration to caller."""
+    # Register custom service: send_order
+    async def async_handle_send_order(call: ServiceCall) -> None:
+        device_id: str = call.data["device_id"]
+        order_id: str = call.data["order_id"]
+        _LOGGER.info("Executing custom acoGO order '%s' for device %s", order_id, device_id)
+        try:
+            await api.send_order(device_id, order_id)
+        except Exception as err:
+            raise HomeAssistantError(f"Failed to execute order '{order_id}': {err}") from err
+
+    hass.services.async_register(DOMAIN, "send_order", async_handle_send_order)
+
+    # Register custom service: switch_camera
+    async def async_handle_switch_camera(call: ServiceCall) -> None:
+        device_id: str = call.data["device_id"]
+        _LOGGER.info("Switching camera for device %s", device_id)
+        try:
+            await api.switch_video(device_id)
+        except Exception as err:
+            raise HomeAssistantError(f"Failed to switch camera: {err}") from err
+
+    hass.services.async_register(DOMAIN, "switch_camera", async_handle_switch_camera)
+
+    # Register custom service: start_webrtc_stream
+    async def async_handle_start_stream(call: ServiceCall) -> dict[str, Any]:
         device_id = call.data.get("device_id") or next(iter(coordinator.data), None)
         if not device_id:
             raise HomeAssistantError("Intercom device not found")
 
         params = await coordinator.async_start_preview(device_id)
         aws = params.get("aws", {})
-        if not isinstance(aws, dict):
-            raise HomeAssistantError("AWS credentials not available from cloud preview session")
+        if not aws or not aws.get("channel arn"):
+            raise HomeAssistantError("Failed to obtain valid AWS streaming credentials from acoGO Cloud")
 
-        from .webrtc import generate_signed_wss_url, fetch_ice_servers
-        # Generate unique random client_id for every viewer session to avoid KVS session collisions
-        client_id = f"HABrowser_{uuid.uuid4().hex[:8]}"
-        wss_url = generate_signed_wss_url(aws, client_id)
-        ice_servers = await fetch_ice_servers(session, aws)
-        ice_list: list[dict[str, Any]] = []
-        for s in ice_servers:
-            item: dict[str, Any] = {"urls": s.urls}
-            if s.username:
-                item["username"] = s.username
-            if s.credential:
-                item["credential"] = s.credential
-            ice_list.append(item)
-
-        channel_name = aws.get("channel name") or aws.get("channelName", "") or aws.get("channel_name", "")
+        from .webrtc import generate_signed_wss_url
+        client_id = f"HAViewer_{int(time.time())}"
+        signed_wss = generate_signed_wss_url(aws, client_id)
 
         return {
-            "wss_url": wss_url,
-            "ice_servers": ice_list,
-            "device_id": device_id,
-            "channel_name": channel_name,
-            "timeout": 45,
+            "channel_arn": aws.get("channel arn"),
+            "channel_name": aws.get("channel name"),
+            "region": aws.get("region", "eu-west-2"),
+            "signed_wss_url": signed_wss,
+            "call_id": params.get("callId"),
         }
 
     hass.services.async_register(
         DOMAIN,
         "start_webrtc_stream",
-        async_handle_start_webrtc_stream,
+        async_handle_start_stream,
         supports_response=SupportsResponse.ONLY,
     )
 
-    async def async_handle_stop_webrtc_stream(call: ServiceCall) -> dict[str, Any]:
-        """Terminate preview session and release intercom line."""
+    # Register custom service: stop_webrtc_stream
+    async def async_handle_stop_stream(call: ServiceCall) -> None:
         device_id = call.data.get("device_id") or next(iter(coordinator.data), None)
         if device_id:
             await coordinator.async_stop_preview(device_id)
-        return {"status": "ok"}
 
-    hass.services.async_register(
-        DOMAIN,
-        "stop_webrtc_stream",
-        async_handle_stop_webrtc_stream,
-        supports_response=SupportsResponse.OPTIONAL,
-    )
+    hass.services.async_register(DOMAIN, "stop_webrtc_stream", async_handle_stop_stream)
 
-    # Register capture_snapshot service for Telegram automations
+    # Register custom service: capture_snapshot
     async def async_handle_capture_snapshot(call: ServiceCall) -> dict[str, Any]:
-        """Capture a snapshot from acoGO camera and save to disk."""
+        """Capture video snapshot with fallback to last real camera image if live stream busy."""
         device_id = call.data.get("device_id") or next(iter(coordinator.data), None)
         if not device_id:
             raise HomeAssistantError("Intercom device not found")
 
         raw_filename = call.data.get("filename", "/config/www/doorbell_latest.jpg")
-        timeout = float(call.data.get("timeout", 10.0))
+        timeout = float(call.data.get("timeout", 20.0))
 
-        # Safe directory path resolution
         if hass.config.is_allowed_path(raw_filename):
             target_path = Path(raw_filename)
         else:
             safe_name = Path(raw_filename).name or "doorbell_latest.jpg"
             target_path = Path(hass.config.path("www", safe_name))
 
-        # Ensure parent directory exists
         await hass.async_add_executor_job(target_path.parent.mkdir, 0o755, True, True)
 
-        params = await coordinator.async_start_preview(device_id)
-        aws = params.get("aws", {})
-        if not isinstance(aws, dict):
-            raise HomeAssistantError("AWS credentials not available from cloud preview")
+        params = await coordinator.async_start_preview(device_id, retry_count=3)
+        aws = params.get("aws") if isinstance(params, dict) else None
 
-        from .webrtc import async_capture_webrtc_snapshot, generate_snapshot_fallback_card
-        jpeg_bytes = await async_capture_webrtc_snapshot(session, aws, timeout=timeout)
+        jpeg_bytes: bytes | None = None
 
+        # If AWS credentials are valid, capture live WebRTC frame
+        if isinstance(aws, dict) and aws.get("access key ID") and aws.get("channel arn"):
+            from .webrtc import async_capture_webrtc_snapshot
+            jpeg_bytes = await async_capture_webrtc_snapshot(session, aws, timeout=timeout)
+            if jpeg_bytes:
+                coordinator.last_valid_snapshot[device_id] = (time.time(), jpeg_bytes)
+
+        # Fallback 1: Use last captured valid real frame if fresh (TTL < 15 min = 900s)
         if not jpeg_bytes:
+            cached_entry = coordinator.last_valid_snapshot.get(device_id)
+            if cached_entry:
+                cached_time, cached_bytes = cached_entry
+                if time.time() - cached_time < 900.0:
+                    _LOGGER.info("Using cached real camera snapshot from %s ago", int(time.time() - cached_time))
+                    jpeg_bytes = cached_bytes
+
+        # Fallback 2: Generate status graphic card if no real frame available
+        if not jpeg_bytes:
+            from .webrtc import generate_snapshot_fallback_card
             info = coordinator.data.get(device_id, {}).get("info", {})
             panel_name = info.get("name", f"acoGO {device_id}")
             jpeg_bytes = await hass.async_add_executor_job(generate_snapshot_fallback_card, panel_name)
@@ -293,7 +193,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         await hass.async_add_executor_job(_write_file, target_path, jpeg_bytes)
 
-        is_ringing = coordinator.data.get(device_id, {}).get("ringing", False)
+        is_ringing = coordinator.data.get(device_id, {}).get("is_ringing", False)
         if not is_ringing:
             await coordinator.async_stop_preview(device_id)
 
@@ -310,6 +210,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         async_handle_capture_snapshot,
         supports_response=SupportsResponse.OPTIONAL,
     )
+
+    # Periodic background snapshot refresher (every 10 minutes) so fresh camera frame is always ready
+    async def _async_background_snapshot_refresh(*_: Any) -> None:
+        for dev_id in coordinator.data:
+            if not coordinator.is_preview_active(dev_id) and not coordinator.data.get(dev_id, {}).get("is_ringing"):
+                try:
+                    p = await coordinator.async_start_preview(dev_id, retry_count=1)
+                    aws_p = p.get("aws")
+                    if isinstance(aws_p, dict) and aws_p.get("access key ID") and aws_p.get("channel arn"):
+                        from .webrtc import async_capture_webrtc_snapshot
+                        frame = await async_capture_webrtc_snapshot(session, aws_p, timeout=12.0)
+                        if frame:
+                            coordinator.last_valid_snapshot[dev_id] = (time.time(), frame)
+                            _LOGGER.debug("Background camera frame cache refreshed for %s", dev_id)
+                except Exception as err:
+                    _LOGGER.debug("Background snapshot refresh error for %s: %s", dev_id, err)
+                finally:
+                    await coordinator.async_stop_preview(dev_id)
+
+    # Run background refresh every 10 minutes
+    async_track_time_interval(hass, _async_background_snapshot_refresh, timedelta(minutes=10))
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
@@ -329,4 +250,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.services.async_remove(DOMAIN, "start_webrtc_stream")
             hass.services.async_remove(DOMAIN, "stop_webrtc_stream")
             hass.services.async_remove(DOMAIN, "capture_snapshot")
+            hass.services.async_remove(DOMAIN, "send_order")
+            hass.services.async_remove(DOMAIN, "switch_camera")
+
     return unload_ok

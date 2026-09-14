@@ -10,6 +10,7 @@ import aiohttp
 
 from .const import (
     BASE_URL,
+    CHECK_STATE_TIMEOUT,
     DOOR_CALL_DELAY,
     DOOR_HOLD_DELAY,
     ORDER_END_CALL,
@@ -103,7 +104,7 @@ class AcoGoApiClient:
             async with self.session.post(url, json=payload, headers=headers, timeout=API_TIMEOUT) as resp:
                 if resp.status == 401:
                     raise AcoGoAuthError("Invalid credentials")
-                if resp.status not in (200, 201):
+                if resp.status not in (200, 201, 202):
                     text = await resp.text()
                     raise AcoGoApiError(f"Registration failed ({resp.status}): {text}")
                 data = await self._parse_response(resp)
@@ -137,13 +138,18 @@ class AcoGoApiClient:
             "devicePassword": self.device_password,
         }
 
-    async def _request(self, method: str, path: str, json: Any = None) -> Any:
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        json: Any = None,
+        custom_timeout: aiohttp.ClientTimeout | None = None,
+    ) -> Any:
         url = f"{BASE_URL}{path}"
+        req_timeout = custom_timeout or API_TIMEOUT
         try:
-            async with self.session.request(method, url, json=json, headers=self._get_headers(), timeout=API_TIMEOUT) as resp:
+            async with self.session.request(method, url, json=json, headers=self._get_headers(), timeout=req_timeout) as resp:
                 if resp.status == 401:
-                    # Specific check: 401 on /order/video-sw is a feature authorization rejection
-                    # (device lacks PRO multi-camera hardware/license), NOT an expired token!
                     if path == "/order/video-sw":
                         text = await resp.text()
                         raise AcoGoApiError(
@@ -155,18 +161,16 @@ class AcoGoApiClient:
                         _LOGGER.info("ACO GO token expired (401). Handling re-authentication...")
                         current_pwd = self.device_password
                         async with self._auth_lock:
-                            # Double-checked locking: only re-register if password was not already refreshed
                             if self.device_password == current_pwd:
                                 await self.register_device()
 
-                        # Retry with refreshed password
-                        async with self.session.request(method, url, json=json, headers=self._get_headers(), timeout=API_TIMEOUT) as retry_resp:
-                            if retry_resp.status not in (200, 201):
+                        async with self.session.request(method, url, json=json, headers=self._get_headers(), timeout=req_timeout) as retry_resp:
+                            if retry_resp.status not in (200, 201, 202):
                                 text = await retry_resp.text()
                                 raise AcoGoApiError(f"Request failed after re-auth: {retry_resp.status} on {path}: {text}")
                             return await self._parse_response(retry_resp)
 
-                if resp.status not in (200, 201):
+                if resp.status not in (200, 201, 202):
                     text = await resp.text()
                     raise AcoGoApiError(f"API error {resp.status} on {path}: {text}")
                 return await self._parse_response(resp)
@@ -177,16 +181,29 @@ class AcoGoApiClient:
         """Fetch list of user devices."""
         data = await self._request("GET", "/device-by-app")
         if isinstance(data, list):
-            # Filter out mobile apps (model 62 and 63)
             return [d for d in data if d.get("model") not in (62, 63)]
         return []
 
     async def check_state(self, device_id: str) -> str:
-        """Check status of intercom line ('ready', 'busy', 'offline')."""
-        res = await self._request("POST", "/device/check-state", json={"devId": device_id})
-        if isinstance(res, dict):
-            return res.get("response", "offline")
-        return "offline"
+        """Check status of intercom line ('ready', 'busy', 'offline') with fast dedicated timeout.
+        
+        Strict validation: NEVER return 'busy' on network timeout, empty body, or connection error
+        to completely eliminate phantom call triggers. Only explicit server responses are honored.
+        """
+        fast_timeout = aiohttp.ClientTimeout(total=CHECK_STATE_TIMEOUT, connect=2.0)
+        try:
+            res = await self._request("POST", "/device/check-state", json={"devId": device_id}, custom_timeout=fast_timeout)
+            if isinstance(res, dict):
+                val = res.get("response")
+                if val in ("ready", "busy", "offline"):
+                    return val
+            return "ready"
+        except (asyncio.TimeoutError, TimeoutError):
+            _LOGGER.debug("check-state timed out for %s (transient cloud/network delay, assuming ready)", device_id)
+            return "ready"
+        except Exception as err:
+            _LOGGER.debug("check-state error for %s: %r (assuming ready)", device_id, err)
+            return "ready"
 
     async def send_order(self, target_id: str, order_id: str) -> bool:
         """Send command to intercom."""
@@ -200,7 +217,6 @@ class AcoGoApiClient:
     async def open_door_sequence(self, target_id: str, is_gate: bool = False) -> bool:
         """Safely execute door/gate unlock with device locking and guaranteed endCall."""
         lock = self.get_device_lock(target_id)
-        # Door is f2Open and Gate is ezOpen
         order_cmd = ORDER_EZ_OPEN if is_gate else ORDER_F2_OPEN
 
         async with lock:
@@ -208,10 +224,8 @@ class AcoGoApiClient:
             is_active_call = (state == "busy")
 
             if is_active_call:
-                # Direct unlock during active call
                 return await self.send_order(target_id, order_cmd)
 
-            # Idle sequence: receiveCall -> wait 3s -> open -> wait 5s -> endCall
             try:
                 await self.send_order(target_id, ORDER_RECEIVE_CALL)
                 await asyncio.sleep(DOOR_CALL_DELAY)
@@ -219,7 +233,6 @@ class AcoGoApiClient:
                 await asyncio.sleep(DOOR_HOLD_DELAY)
                 return True
             finally:
-                # Guaranteed line release even on cancellation or error
                 try:
                     await self.send_order(target_id, ORDER_END_CALL)
                 except Exception as err:
@@ -232,8 +245,8 @@ class AcoGoApiClient:
             await self._request("POST", "/order/video-sw", json={"targetId": target_id})
             return True
 
-    async def request_preview(self, device_id: str, preview_type: str = "audio-video") -> dict[str, Any]:
-        """Request live WebRTC/Kinesis video preview session."""
+    async def request_preview(self, device_id: str, preview_type: str = "video-only") -> dict[str, Any]:
+        """Request live WebRTC/Kinesis video preview session (video-only avoids audio contention during calls)."""
         res = await self._request("POST", "/preview/request", json={"devId": device_id, "previewType": preview_type})
         return res if isinstance(res, dict) else {}
 

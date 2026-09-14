@@ -36,3 +36,7 @@ Thumbs.db
 *.swo
 .vscode/
 .idea/
+
+# Logs and scratch scripts
+acogo.log
+scratch/
