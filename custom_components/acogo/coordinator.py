@@ -106,9 +106,10 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_start_preview(self, dev_id: str) -> dict[str, Any]:
         """Start live preview session for intercom device with watchdog protection."""
-        if dev_id in self.preview_active_devices and self.preview_active_devices[dev_id]:
-            _LOGGER.debug("Reusing active preview session for %s", dev_id)
-            return self.preview_active_devices[dev_id]
+        # Always terminate any previous preview session cleanly to release physical line and reset intercom
+        if self.is_preview_active(dev_id):
+            _LOGGER.debug("Terminating previous preview session for %s before starting new", dev_id)
+            await self.async_stop_preview(dev_id)
 
         try:
             resp = await self.api.request_preview(dev_id)
