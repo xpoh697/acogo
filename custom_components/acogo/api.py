@@ -185,12 +185,13 @@ class AcoGoApiClient:
         return []
 
     async def check_state(self, device_id: str) -> str:
-        """Check status of intercom line ('ready', 'busy', 'offline') with fast dedicated timeout.
+        """Check status of intercom line ('ready', 'busy', 'offline') with dedicated timeout.
         
-        Strict validation: NEVER return 'busy' on network timeout, empty body, or connection error
-        to completely eliminate phantom call triggers. Only explicit server responses are honored.
+        Strict validation: during physical doorbell calls the ACO gateway takes 3.5-5.5s
+        to answer check-state over the bus. With a 10s timeout, the server's genuine
+        'busy' response is captured reliably without timing out prematurely.
         """
-        fast_timeout = aiohttp.ClientTimeout(total=CHECK_STATE_TIMEOUT, connect=2.0)
+        fast_timeout = aiohttp.ClientTimeout(total=CHECK_STATE_TIMEOUT, connect=3.0)
         try:
             res = await self._request("POST", "/device/check-state", json={"devId": device_id}, custom_timeout=fast_timeout)
             if isinstance(res, dict):
@@ -199,7 +200,7 @@ class AcoGoApiClient:
                     return val
             return "ready"
         except (asyncio.TimeoutError, TimeoutError):
-            _LOGGER.debug("check-state timed out for %s (transient cloud/network delay, assuming ready)", device_id)
+            _LOGGER.debug("check-state timed out (>%ss) for %s (assuming ready)", CHECK_STATE_TIMEOUT, device_id)
             return "ready"
         except Exception as err:
             _LOGGER.debug("check-state error for %s: %r (assuming ready)", device_id, err)

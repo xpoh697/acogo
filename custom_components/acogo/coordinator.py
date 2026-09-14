@@ -83,13 +83,6 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     is_preview = self.is_preview_active(dev_id)
                     is_busy = (state_resp == "busy" and not is_preview)
 
-                    # Debounce confirmation: if first time observing busy, confirm after 350ms to eliminate any network hiccup
-                    if is_busy and not dev_entry.get("is_ringing"):
-                        await asyncio.sleep(0.35)
-                        confirm_state = await self.api.check_state(dev_id)
-                        if confirm_state != "busy":
-                            is_busy = False
-
                     if is_busy:
                         # Call active: latch for at least CALL_LATCH_DURATION (20s)
                         self._call_latch_until[dev_id] = now_ts + CALL_LATCH_DURATION
