@@ -1,4 +1,4 @@
-"""DataUpdateCoordinator for ACO GO."""
+"""DataUpdateCoordinator for ACO GO with fast line monitoring for instant call detection."""
 from __future__ import annotations
 
 import asyncio
@@ -11,28 +11,101 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import AcoGoApiClient, AcoGoApiError
-from .const import DOMAIN, PREVIEW_WATCHDOG_TIMEOUT
+from .const import (
+    APP_MODELS,
+    CALL_LATCH_DURATION,
+    DOMAIN,
+    FAST_POLL_INTERVAL,
+    PREVIEW_WATCHDOG_TIMEOUT,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 
 class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    """Class to manage fetching ACO GO data from cloud."""
+    """Class to manage fetching ACO GO data from cloud with fast line monitoring."""
 
     def __init__(self, hass: HomeAssistant, api: AcoGoApiClient) -> None:
         super().__init__(
             hass,
             _LOGGER,
             name=DOMAIN,
-            update_interval=timedelta(seconds=10),
+            update_interval=timedelta(seconds=30),
         )
         self.api = api
         self.preview_active_devices: dict[str, dict[str, Any]] = {}
         self._preview_watchdog_handles: dict[str, asyncio.TimerHandle] = {}
+        self._call_latch_until: dict[str, float] = {}
+        self._line_monitor_task: asyncio.Task | None = None
+
+    def start_line_monitor(self) -> None:
+        """Start the high-frequency line state monitor task if not already running."""
+        if self._line_monitor_task is None or self._line_monitor_task.done():
+            self._line_monitor_task = self.hass.async_create_task(self._async_line_monitor_loop())
+
+    def stop_line_monitor(self) -> None:
+        """Stop line state monitor task."""
+        if self._line_monitor_task and not self._line_monitor_task.done():
+            self._line_monitor_task.cancel()
+            self._line_monitor_task = None
+
+    async def _async_line_monitor_loop(self) -> None:
+        """High-frequency line state monitor (3.0s) for instant doorbell call detection."""
+        _LOGGER.debug("Starting high-frequency line monitor loop for acoGO")
+        try:
+            while True:
+                await asyncio.sleep(FAST_POLL_INTERVAL)
+                if not self.data:
+                    continue
+
+                now_ts = asyncio.get_running_loop().time()
+                state_changed = False
+
+                for dev_id, dev_entry in list(self.data.items()):
+                    model = dev_entry.get("info", {}).get("model")
+                    if model in APP_MODELS or self.api.is_device_busy(dev_id):
+                        continue
+
+                    try:
+                        state_resp = await self.api.check_state(dev_id)
+                    except Exception as err:
+                        _LOGGER.debug("Line monitor error checking state for %s: %s", dev_id, err)
+                        continue
+
+                    is_preview = self.is_preview_active(dev_id)
+                    is_busy = (state_resp == "busy" and not is_preview)
+
+                    if is_busy:
+                        # Call active: latch for at least CALL_LATCH_DURATION (15s)
+                        self._call_latch_until[dev_id] = now_ts + CALL_LATCH_DURATION
+                        if not dev_entry.get("is_ringing"):
+                            dev_name = dev_entry.get("info", {}).get("name", dev_id)
+                            _LOGGER.info("Doorbell ringing on intercom %s (%s)!", dev_id, dev_name)
+                            self.hass.bus.async_fire("acogo_incoming_call", {
+                                "device_id": dev_id,
+                                "name": dev_name,
+                            })
+
+                    is_ringing = (now_ts < self._call_latch_until.get(dev_id, 0)) or is_busy
+
+                    prev_ringing = dev_entry.get("is_ringing", False)
+                    prev_state = dev_entry.get("state")
+
+                    if is_ringing != prev_ringing or state_resp != prev_state:
+                        dev_entry["state"] = state_resp
+                        dev_entry["is_online"] = (state_resp != "offline")
+                        dev_entry["is_ringing"] = is_ringing
+                        state_changed = True
+
+                if state_changed:
+                    self.async_update_listeners()
+        except asyncio.CancelledError:
+            _LOGGER.debug("Line monitor loop cancelled cleanly")
+        except Exception as err:
+            _LOGGER.warning("Unexpected error in line monitor loop: %s", err)
 
     async def async_start_preview(self, dev_id: str) -> dict[str, Any]:
         """Start live preview session for intercom device with watchdog protection."""
-        # Singleton check: reuse active preview parameters if already active
         if dev_id in self.preview_active_devices and self.preview_active_devices[dev_id]:
             _LOGGER.debug("Reusing active preview session for %s", dev_id)
             return self.preview_active_devices[dev_id]
@@ -86,6 +159,7 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         try:
             devices = await self.api.get_device_list()
             devices_data: dict[str, Any] = {}
+            now_ts = asyncio.get_running_loop().time()
 
             for dev in devices:
                 dev_id = dev["devId"]
@@ -96,8 +170,11 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     prev_state = self.data.get(dev_id, {}).get("state", "ready") if self.data else "ready"
                     state_resp = prev_state
 
-                # Line is ringing if busy and not currently in user preview session
-                is_ringing = (state_resp == "busy" and not self.is_preview_active(dev_id))
+                is_busy = (state_resp == "busy" and not self.is_preview_active(dev_id) and not self.api.is_device_busy(dev_id))
+                if is_busy:
+                    self._call_latch_until[dev_id] = now_ts + CALL_LATCH_DURATION
+
+                is_ringing = (now_ts < self._call_latch_until.get(dev_id, 0)) or is_busy
 
                 devices_data[dev_id] = {
                     "info": dev,

@@ -56,6 +56,11 @@ class AcoGoApiClient:
             self._device_locks[device_id] = asyncio.Lock()
         return self._device_locks[device_id]
 
+    def is_device_busy(self, device_id: str) -> bool:
+        """Check if an internal door unlock sequence is currently in progress for device."""
+        lock = self._device_locks.get(device_id)
+        return lock is not None and lock.locked()
+
     async def _parse_response(self, resp: aiohttp.ClientResponse) -> Any:
         """Robustly parse response without failing on text/plain, empty bodies, or non-JSON."""
         text = await resp.text()

@@ -76,6 +76,16 @@ class AcoGoCallSensor(CoordinatorEntity[AcoGoDataUpdateCoordinator], BinarySenso
         return self.coordinator.data.get(self.dev_id, {}).get("is_ringing", False)
 
     @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Extra state attributes for incoming call sensor."""
+        data = self.coordinator.data.get(self.dev_id, {})
+        return {
+            "intercom_state": data.get("state", "unknown"),
+            "is_online": data.get("is_online", False),
+            "line_busy": data.get("state") == "busy",
+        }
+
+    @property
     def device_info(self) -> dict[str, Any]:
         info = self.coordinator.data.get(self.dev_id, {}).get("info", {})
         return {
