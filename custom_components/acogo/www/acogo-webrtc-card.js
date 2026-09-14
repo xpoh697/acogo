@@ -1,7 +1,7 @@
 /**
  * acoGO! Live WebRTC Lovelace Card
  * Directly connects to AWS Kinesis Video Streams WebRTC for ultra-low latency intercom video feed.
- * Version: 1.0.3
+ * Version: 1.0.4
  */
 
 class AcoGoWebRtcCard extends HTMLElement {
@@ -313,7 +313,7 @@ class AcoGoWebRtcCard extends HTMLElement {
     if (this._status === 'connecting' || this._status === 'streaming') return;
 
     this._updateStatus('connecting', 'ПОДКЛЮЧЕНИЕ...');
-    this._updateConnectingStep('[1/3] Запрос сессии облака...', 'Получение AWS Kinesis параметров...');
+    this._updateConnectingStep('[1/3] Запрос сессии облака...', 'Получение параметров AWS Kinesis...');
     this.shadowRoot.getElementById('overlayIdle').style.display = 'none';
     this.shadowRoot.getElementById('overlayConnecting').style.display = 'flex';
 
@@ -360,7 +360,7 @@ class AcoGoWebRtcCard extends HTMLElement {
     const { wss_url, ice_servers, channel_name, timeout } = data;
     const video = this.shadowRoot.getElementById('videoPlayer');
 
-    this._updateConnectingStep('[2/3] Обмен SDP и ICE...', 'Подключение к AWS Kinesis Signaling Channel');
+    this._updateConnectingStep('[2/3] Обмен SDP и ICE...', 'Инициализация WebRTC PeerConnection...');
 
     this._pendingIceCandidates = [];
     this._hasRemoteDescription = false;
@@ -369,12 +369,16 @@ class AcoGoWebRtcCard extends HTMLElement {
       iceServers: ice_servers || []
     });
 
+    // CRITICAL: Declare video receiver transceiver to generate m=video line in SDP Offer
+    this._pc.addTransceiver('video', { direction: 'recvonly' });
+
     // Create DataChannel matching official acoGO Android/iOS app
     const chName = channel_name || `aco_${data.device_id}`;
     try {
       this._dataChannel = this._pc.createDataChannel(chName);
       this._dataChannel.onopen = () => {
         console.log('[acoGO WebRTC] DataChannel open, sending handshake');
+        this._updateConnectingStep('[2/3] Обмен SDP и ICE...', 'Канал данных открыт, рукопожатие...');
         try {
           this._dataChannel.send(JSON.stringify({ network: { type: 'wifi' } }));
         } catch (e) {}
@@ -424,9 +428,15 @@ class AcoGoWebRtcCard extends HTMLElement {
 
     this._pc.onicecandidate = (event) => {
       if (event.candidate && this._ws && this._ws.readyState === WebSocket.OPEN) {
+        const cand = event.candidate.toJSON ? event.candidate.toJSON() : {
+          candidate: event.candidate.candidate,
+          sdpMid: event.candidate.sdpMid,
+          sdpMLineIndex: event.candidate.sdpMLineIndex,
+          usernameFragment: event.candidate.usernameFragment
+        };
         const msg = {
           action: 'ICE_CANDIDATE',
-          messagePayload: btoa(JSON.stringify(event.candidate))
+          messagePayload: btoa(JSON.stringify(cand))
         };
         this._ws.send(JSON.stringify(msg));
       }
@@ -434,6 +444,7 @@ class AcoGoWebRtcCard extends HTMLElement {
 
     this._pc.oniceconnectionstatechange = () => {
       console.log('[acoGO WebRTC] ICE connection state:', this._pc.iceConnectionState);
+      this._updateConnectingStep('[2/3] Обмен SDP и ICE...', `ICE: ${this._pc.iceConnectionState}`);
       if (this._pc.iceConnectionState === 'failed') {
         clearTimeout(this._connectTimeout);
         this._updateStatus('error', 'СБОЙ P2P');
@@ -446,12 +457,11 @@ class AcoGoWebRtcCard extends HTMLElement {
 
     this._ws.onopen = async () => {
       console.log('[acoGO WebRTC] Signaling WebSocket open, creating offer...');
-      const offer = await this._pc.createOffer({
-        offerToReceiveVideo: true,
-        offerToReceiveAudio: false
-      });
+      this._updateConnectingStep('[2/3] Обмен SDP и ICE...', 'WS подключен, отправка SDP Offer...');
+      const offer = await this._pc.createOffer();
       await this._pc.setLocalDescription(offer);
 
+      this._updateConnectingStep('[2/3] Обмен SDP и ICE...', 'SDP Offer отправлен, ожидание домофона...');
       const msg = {
         action: 'SDP_OFFER',
         messagePayload: btoa(JSON.stringify({
@@ -467,6 +477,7 @@ class AcoGoWebRtcCard extends HTMLElement {
         const msg = JSON.parse(evt.data);
         if (msg.messageType === 'SDP_ANSWER') {
           console.log('[acoGO WebRTC] Received SDP_ANSWER');
+          this._updateConnectingStep('[2/3] Обмен SDP и ICE...', 'SDP Answer получен, согласование ICE...');
           const payload = JSON.parse(atob(msg.messagePayload));
           await this._pc.setRemoteDescription(new RTCSessionDescription(payload));
           this._hasRemoteDescription = true;
@@ -502,10 +513,14 @@ class AcoGoWebRtcCard extends HTMLElement {
 
     this._ws.onerror = (err) => {
       console.error('[acoGO WebRTC] WebSocket error:', err);
+      this._updateConnectingStep('[Ошибка]', 'Ошибка WebSocket соединения с Kinesis');
     };
 
-    this._ws.onclose = () => {
-      console.log('[acoGO WebRTC] Signaling WebSocket closed');
+    this._ws.onclose = (evt) => {
+      console.log('[acoGO WebRTC] Signaling WebSocket closed', evt.code, evt.reason);
+      if (this._status === 'connecting') {
+        this._updateConnectingStep('[Закрыт]', `WebSocket закрыт (${evt.code})`);
+      }
     };
   }
 
@@ -616,4 +631,4 @@ window.customCards.push({
   name: 'acoGO! Live WebRTC Camera',
   description: 'Прямой видеопоток 30 FPS с домофона acoGO через браузерный WebRTC'
 });
-console.info('%c ACOGO-WEBRTC-CARD %c v1.0.3 Loaded ', 'background:#0284c7;color:#fff;font-weight:bold;', 'background:#0d121c;color:#10b981;');
+console.info('%c ACOGO-WEBRTC-CARD %c v1.0.4 Loaded ', 'background:#0284c7;color:#fff;font-weight:bold;', 'background:#0d121c;color:#10b981;');
