@@ -2,16 +2,21 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
+from aiohttp import web
+
+from homeassistant.components import frontend
+from homeassistant.components.http import HomeAssistantView
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, Platform
+from homeassistant.core import CoreState, HomeAssistant, ServiceCall, SupportsResponse
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import AcoGoApiClient
-from .const import CONF_DEV_ID, CONF_DEVICE_PASSWORD, CONF_PASSWORD, CONF_USERNAME, DOMAIN
+from .const import CONF_DEV_ID, CONF_DEVICE_PASSWORD, CONF_PASSWORD, CONF_USERNAME, DOMAIN, VERSION
 from .coordinator import AcoGoDataUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -24,10 +29,121 @@ PLATFORMS: list[Platform] = [
     Platform.SWITCH,
 ]
 
+ALLOWED_STATIC_FILES = {"acogo-webrtc-card.js"}
+
+
+class CardStaticView(HomeAssistantView):
+    """View to serve static Lovelace card files with no-cache and CORS headers."""
+
+    url = f"/api/{DOMAIN}/static/{{filename}}"
+    name = f"api:{DOMAIN}:static"
+    requires_auth = False
+    cors_allowed = True
+
+    def __init__(self, www_path: Path) -> None:
+        """Initialize view with www path."""
+        self._www_path = www_path
+
+    async def get(self, request: web.Request, filename: str) -> web.Response:
+        """Handle GET request for static files."""
+        if filename not in ALLOWED_STATIC_FILES:
+            return web.Response(status=404)
+
+        file_path = self._www_path / filename
+        if not file_path.is_file():
+            return web.Response(status=404)
+
+        try:
+            return web.FileResponse(
+                file_path,
+                headers={"Cache-Control": "no-cache, no-store, must-revalidate, max-age=0"},
+            )
+        except Exception:
+            return web.Response(status=500)
+
+
+async def _async_register_card(hass: HomeAssistant) -> None:
+    """Register the Lovelace card with Lovelace resources and frontend."""
+    card_url = f"/api/{DOMAIN}/static/acogo-webrtc-card.js?v={VERSION}"
+
+    # 1. Direct injection into all dashboards immediately (works across all Lovelace modes)
+    try:
+        frontend.add_extra_js_url(hass, card_url)
+        _LOGGER.debug("Registered acoGO card via add_extra_js_url: %s", card_url)
+    except Exception as err:
+        _LOGGER.warning("Failed to register acoGO card via add_extra_js_url: %s", err)
+
+    # 2. Register in Lovelace storage resources
+    registered = await _async_register_lovelace_resource(hass, card_url)
+    if registered:
+        _LOGGER.info("Registered acoGO Lovelace resource: %s", card_url)
+
+
+async def _async_register_lovelace_resource(hass: HomeAssistant, url: str) -> bool:
+    """Create or update the Lovelace resource entry, cleaning up duplicates and legacy URLs."""
+    lovelace_data = hass.data.get("lovelace")
+    if lovelace_data is None:
+        return False
+
+    resources = getattr(lovelace_data, "resources", None)
+    if resources is None:
+        return False
+
+    if not hasattr(resources, "async_create_item") or not hasattr(resources, "async_update_item"):
+        return False
+
+    base_url = url.split("?")[0]
+    legacy_url = "/local/acogo-webrtc-card.js"
+    matched_items = []
+
+    try:
+        for item in resources.async_items():
+            existing_url = item.get("url") or ""
+            existing_base = existing_url.split("?")[0]
+            if existing_base in (base_url, legacy_url):
+                matched_items.append(item)
+    except Exception:
+        return False
+
+    try:
+        if matched_items:
+            first_item = matched_items[0]
+            if first_item.get("url") != url:
+                await resources.async_update_item(first_item["id"], {"res_type": "module", "url": url})
+                _LOGGER.info("Updated Lovelace resource to: %s", url)
+
+            if len(matched_items) > 1 and hasattr(resources, "async_delete_item"):
+                for dup in matched_items[1:]:
+                    await resources.async_delete_item(dup["id"])
+                    _LOGGER.info("Removed duplicate/legacy Lovelace resource: %s", dup.get("url"))
+        else:
+            await resources.async_create_item({"res_type": "module", "url": url})
+            _LOGGER.info("Created Lovelace resource: %s", url)
+        return True
+    except Exception as err:
+        _LOGGER.warning("Failed to register/update Lovelace resource: %s", err)
+        return False
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up acoGO! from a config entry."""
     hass.data.setdefault(DOMAIN, {})
+
+    # Register static HTTP view once per HA lifetime
+    if not hass.data[DOMAIN].get("_view_registered"):
+        if getattr(hass, "http", None) is not None:
+            www_path = Path(__file__).parent / "www"
+            hass.http.register_view(CardStaticView(www_path))
+        hass.data[DOMAIN]["_view_registered"] = True
+
+    # Register card automatically in Lovelace
+    if hass.state == CoreState.running:
+        hass.async_create_task(_async_register_card(hass))
+    else:
+        async def _register_card_after_start(event: Any) -> None:
+            await _async_register_card(hass)
+
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _register_card_after_start)
 
     session = async_get_clientsession(hass)
 
