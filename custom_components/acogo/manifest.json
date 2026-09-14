@@ -7,6 +7,6 @@
   "integration_type": "hub",
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/aco-ha/acogo/issues",
-  "requirements": ["pillow", "aiortc"],
-  "version": "1.0.8"
+  "requirements": ["aiortc"],
+  "version": "1.0.9"
 }

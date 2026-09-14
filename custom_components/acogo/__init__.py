@@ -14,6 +14,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, Platform
 from homeassistant.core import CoreState, HomeAssistant, ServiceCall, SupportsResponse
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import AcoGoApiClient
@@ -26,8 +27,6 @@ PLATFORMS: list[Platform] = [
     Platform.LOCK,
     Platform.BUTTON,
     Platform.BINARY_SENSOR,
-    Platform.CAMERA,
-    Platform.SWITCH,
 ]
 
 ALLOWED_STATIC_FILES = {"acogo-webrtc-card.js"}
@@ -145,6 +144,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             await _async_register_card(hass)
 
         hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _register_card_after_start)
+
+    # Automatically clean up deprecated camera, switch, and preview button entities from entity registry
+    ent_reg = er.async_get(hass)
+    deprecated_entries = [
+        entity_entry.entity_id
+        for entity_entry in er.async_entries_for_config_entry(ent_reg, entry.entry_id)
+        if entity_entry.domain in ("camera", "switch")
+        or entity_entry.unique_id.endswith(("_start_preview", "_stop_preview", "_camera_preview_switch"))
+    ]
+    for entity_id in deprecated_entries:
+        ent_reg.async_remove(entity_id)
+        _LOGGER.info("Removed deprecated entity from registry: %s", entity_id)
 
     session = async_get_clientsession(hass)
 
