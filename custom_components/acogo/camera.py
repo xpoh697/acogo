@@ -20,7 +20,7 @@ from .coordinator import AcoGoDataUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-# Valid minimal 16x16 dark JPEG raw bytes fallback (no base64 or module-level decoding calls)
+# Valid minimal 16x16 dark JPEG raw bytes fallback
 FALLBACK_JPEG_BYTES = (
     b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xdb\x00C\x00\x10\x0b\x0c"
     b"\x0e\x0c\n\x10\x0e\r\x0e\x12\x11\x10\x13\x18(\x1a\x18\x16\x16\x181#%\x1d(:3=<9387@H\\N@DWE78PmQW_bghg"
@@ -83,8 +83,8 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
         Camera.__init__(self)
         self.dev_id = dev_id
         self._attr_unique_id = f"{dev_id}_camera"
-        self._snapshot_lock = asyncio.Lock()
         self._last_image: bytes | None = None
+        self._bg_task: asyncio.Task | None = None
 
     @property
     def is_on(self) -> bool:
@@ -93,10 +93,7 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
 
     @property
     def is_streaming(self) -> bool:
-        """Return False so Home Assistant more-info modal always renders the full image container <hui-image>."""
-        # When Camera.state returns STATE_STREAMING, Home Assistant's more-info dialog attempts
-        # to render <ha-camera-stream>, which collapses to 0 height without HLS stream support.
-        # Keeping is_streaming=False ensures HA always displays the full image view in popups and cards.
+        """Return False so Home Assistant more-info modal always renders the full image view container."""
         return False
 
     @property
@@ -125,6 +122,7 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
             "is_streaming": is_streaming,
             "preview_active": is_streaming,
             "stream_type": "webrtc_kvs",
+            "has_live_image": self._last_image is not None,
             "model": info.get("model"),
             "firmware": info.get("firmware"),
             "software": info.get("software"),
@@ -140,12 +138,57 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
                 attrs["wss_endpoint"] = aws_info.get("wss endpoint")
         return attrs
 
+    def _handle_coordinator_update(self) -> None:
+        """Respond to coordinator state changes and launch background capture if stream is active."""
+        super()._handle_coordinator_update()
+        is_streaming = self.coordinator.is_preview_active(self.dev_id)
+        is_ringing = self.coordinator.data.get(self.dev_id, {}).get("ringing", False)
+        if (is_streaming or is_ringing) and (self._bg_task is None or self._bg_task.done()):
+            self._bg_task = self.hass.async_create_task(self._async_background_capture_loop())
+        elif not is_streaming and not is_ringing and self._bg_task and not self._bg_task.done():
+            self._bg_task.cancel()
+            self._bg_task = None
+            self._last_image = None
+
+    async def _async_background_capture_loop(self) -> None:
+        """Background worker that captures real frames over WebRTC while preview or ringing is active."""
+        try:
+            while self.coordinator.is_preview_active(self.dev_id) or self.coordinator.data.get(self.dev_id, {}).get("ringing", False):
+                params = self.coordinator.get_preview_params(self.dev_id)
+                if params and isinstance(params.get("aws"), dict):
+                    from .webrtc import async_capture_webrtc_snapshot
+                    session = async_get_clientsession(self.hass)
+                    frame_bytes = await async_capture_webrtc_snapshot(
+                        session=session,
+                        aws=params["aws"],
+                        timeout=18.0,
+                    )
+                    if frame_bytes:
+                        _LOGGER.info("Successfully received camera frame from acoGO WebRTC")
+                        self._last_image = frame_bytes
+                        self.async_write_ha_state()
+                        await asyncio.sleep(1.0)
+                        continue
+                await asyncio.sleep(2.0)
+        except asyncio.CancelledError:
+            pass
+        except Exception as err:
+            _LOGGER.debug("Background capture loop error: %s", err)
+        finally:
+            self._bg_task = None
+
     async def async_turn_on(self) -> None:
         """Turn on camera live preview stream."""
         await self.coordinator.async_start_preview(self.dev_id)
+        if self._bg_task is None or self._bg_task.done():
+            self._bg_task = self.hass.async_create_task(self._async_background_capture_loop())
 
     async def async_turn_off(self) -> None:
         """Turn off camera live preview stream."""
+        if self._bg_task and not self._bg_task.done():
+            self._bg_task.cancel()
+            self._bg_task = None
+        self._last_image = None
         await self.coordinator.async_stop_preview(self.dev_id)
 
     def _get_font(self, size: int) -> Any:
@@ -171,7 +214,7 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
         is_ringing: bool,
         is_streaming: bool,
     ) -> bytes:
-        """Render intercom live status snapshot card synchronously with clean typography."""
+        """Render informative camera status card synchronously with clean typography."""
         try:
             from PIL import Image, ImageDraw
 
@@ -179,13 +222,11 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
             img = Image.new("RGB", (width, height), color=(18, 24, 38))
             draw = ImageDraw.Draw(img)
 
-            # Fonts with safe size scaling
             font_title = self._get_font(24)
             font_status = self._get_font(34)
             font_sub = self._get_font(20)
             font_small = self._get_font(18)
 
-            # Top header bar
             draw.rectangle([0, 0, width, 64], fill=(10, 14, 22))
             clean_name = _sanitize_ascii(name.upper())
             title_text = f"ACO INTERCOM - {clean_name}"
@@ -193,15 +234,16 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
             draw.text((32, 20), title_text, fill=(255, 255, 255), font=font_title)
             draw.text((width - 270, 20), now_str, fill=(180, 190, 205), font=font_title)
 
-            # Camera lens graphic
             cx, cy = width // 2, height // 2 - 30
-            if is_streaming:
-                # Active streaming color palette (bright green lens)
-                lens_outer = (24, 58, 38)
-                lens_ring = (0, 230, 118)
-                lens_center = (0, 255, 128)
+            if is_ringing:
+                lens_outer = (58, 24, 24)
+                lens_ring = (255, 75, 75)
+                lens_center = (255, 80, 80)
+            elif is_streaming:
+                lens_outer = (58, 48, 18)
+                lens_ring = (255, 170, 0)
+                lens_center = (255, 190, 20)
             else:
-                # Idle standby color palette (cyan lens)
                 lens_outer = (28, 38, 58)
                 lens_ring = (0, 210, 255)
                 lens_center = (0, 210, 255)
@@ -210,37 +252,33 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
             draw.ellipse([cx - 70, cy - 70, cx + 70, cy + 70], fill=(15, 20, 32), outline=lens_ring, width=2)
             draw.ellipse([cx - 24, cy - 24, cx + 24, cy + 24], fill=lens_center)
 
-            # Status banner
-            if is_streaming:
-                status_text = "STREAMING (LIVE PREVIEW ACTIVE)"
-                status_color = (0, 230, 118)
-                sub_text = "AWS Kinesis WebRTC Active | Intercom Camera Ready"
-            elif is_ringing:
+            if is_ringing:
                 status_text = "INCOMING CALL (RINGING)"
                 status_color = (255, 75, 75)
-                sub_text = "Call in Progress | Doorbell Active"
+                sub_text = "Call in Progress | Doorbell is Ringing"
+            elif is_streaming:
+                status_text = "CONNECTING (STARTING PREVIEW)"
+                status_color = (255, 170, 0)
+                sub_text = "Negotiating WebRTC stream with intercom | Please wait..."
             elif status == "ready":
-                status_text = "LINE READY (ONLINE)"
+                status_text = "LINE READY (STANDBY)"
                 status_color = (46, 204, 113)
-                sub_text = "Standby | Use 'Turn On Camera' to Stream"
+                sub_text = "Standby | Use 'Camera Stream' switch to start preview"
             else:
                 status_text = "STANDBY / IDLE"
                 status_color = (160, 170, 185)
                 sub_text = "acoGO! 2.0 Cloud Connected"
 
-            # Centered status
             st_width = self._get_text_width(draw, status_text, font_status)
             draw.text((cx - st_width // 2, cy + 140), status_text, fill=status_color, font=font_status)
 
-            # Centered subtitle
             sub_width = self._get_text_width(draw, sub_text, font_sub)
             draw.text((cx - sub_width // 2, cy + 190), sub_text, fill=(140, 160, 185), font=font_sub)
 
-            # Bottom info bar
             draw.rectangle([0, height - 54, width, height], fill=(10, 14, 22))
             draw.text((32, height - 38), "acoGO! Home Assistant Integration", fill=(100, 120, 145), font=font_small)
-            footer_right = "Stream: ACTIVE" if is_streaming else "Door Lock: Ready | Gate: Ready"
-            footer_color = (0, 230, 118) if is_streaming else (140, 160, 185)
+            footer_right = "Stream: CONNECTING" if is_streaming else "Door Lock: Ready | Gate: Ready"
+            footer_color = (255, 170, 0) if is_streaming else (140, 160, 185)
             draw.text((width - 320, height - 38), footer_right, fill=footer_color, font=font_small)
 
             buf = io.BytesIO()
@@ -255,55 +293,22 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
         width: int | None = None,
         height: int | None = None,
     ) -> bytes | None:
-        """Return real WebRTC video frame snapshot or status card bytes with non-blocking fallback."""
+        """Return real WebRTC video frame or informative status card immediately."""
         info = self.coordinator.data.get(self.dev_id, {}).get("info", {})
         status = self.coordinator.data.get(self.dev_id, {}).get("state", "unknown")
         is_ringing = self.coordinator.data.get(self.dev_id, {}).get("ringing", False)
         is_streaming = self.coordinator.is_preview_active(self.dev_id)
         panel_name = info.get("name", f"acoGO {self.dev_id}")
 
-        # If call is active or preview is running, attempt fast WebRTC keyframe capture
-        if is_ringing or is_streaming:
-            async with self._snapshot_lock:
-                params = self.coordinator.get_preview_params(self.dev_id)
-                auto_started_preview = False
-                if not params:
-                    try:
-                        params = await self.coordinator.api.request_preview(self.dev_id)
-                        auto_started_preview = True
-                    except Exception as err:
-                        _LOGGER.debug("Could not obtain preview session params for snapshot: %s", err)
-
-                if params and isinstance(params.get("aws"), dict):
-                    try:
-                        from .webrtc import async_capture_webrtc_snapshot
-
-                        session = async_get_clientsession(self.hass)
-                        # Fast timeout for UI response without hanging Lovelace dashboard
-                        capture_timeout = 8.0 if is_ringing else 3.5
-                        frame_bytes = await async_capture_webrtc_snapshot(
-                            session=session,
-                            aws=params["aws"],
-                            timeout=capture_timeout,
-                        )
-                        if frame_bytes:
-                            _LOGGER.info("Captured live camera snapshot from acoGO WebRTC successfully")
-                            self._last_image = frame_bytes
-                            return frame_bytes
-                    except Exception as err:
-                        _LOGGER.debug("WebRTC capture attempt: %s", err)
-                    finally:
-                        if auto_started_preview:
-                            try:
-                                await self.coordinator.api.end_preview()
-                            except Exception:
-                                pass
-
-        # Return cached real image if available
-        if self._last_image and is_streaming:
+        # If we have captured real camera frame and preview or ringing is active, return it immediately!
+        if self._last_image and (is_streaming or is_ringing):
             return self._last_image
 
-        # Fallback to rendered status card
+        # Start background capture worker if needed
+        if (is_streaming or is_ringing) and (self._bg_task is None or self._bg_task.done()):
+            self._bg_task = self.hass.async_create_task(self._async_background_capture_loop())
+
+        # Return generated informative status card
         try:
             image_bytes = await self.hass.async_add_executor_job(
                 self._generate_camera_card,

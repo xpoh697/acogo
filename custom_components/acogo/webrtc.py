@@ -127,13 +127,12 @@ async def fetch_ice_servers(session: Any, aws: dict[str, Any]) -> list[Any]:
             f"{https_endpoint}{path}",
             data=payload,
             headers=headers,
-            timeout=aiohttp.ClientTimeout(total=2.5),
+            timeout=aiohttp.ClientTimeout(total=3.0),
         ) as r:
             if r.status == 200:
                 data = await r.json()
                 ice_servers = list(fallback_servers)
                 for s in data.get("IceServerList", []):
-                    # aiortc handles standard turn: URIs, skip turns:
                     valid_uris = [u for u in s.get("Uris", []) if not u.startswith("turns:")]
                     if valid_uris:
                         ice_servers.append(
@@ -171,7 +170,7 @@ def filter_private_candidates(sdp: str) -> str:
 async def async_capture_webrtc_snapshot(
     session: Any,
     aws: dict[str, Any],
-    timeout: float = 12.0,
+    timeout: float = 18.0,
 ) -> bytes | None:
     """Connect as WebRTC viewer to AWS KVS, receive 1 video frame, and return JPEG bytes."""
     try:
@@ -182,6 +181,8 @@ async def async_capture_webrtc_snapshot(
             RTCSessionDescription,
         )
         from aiortc.sdp import candidate_from_sdp
+        from aiortc.rtp import RtcpPsfbPacket
+        from aiortc.rtcrtpreceiver import pack_remb_fci
     except ImportError:
         _LOGGER.warning("aiortc or aiohttp not available for acoGO WebRTC capture")
         return None
@@ -218,13 +219,17 @@ async def async_capture_webrtc_snapshot(
     @pc.on("connectionstatechange")
     async def on_connection_state_change() -> None:
         if pc.connectionState == "connected":
-            # Send periodic RTCP Picture Loss Indication (PLI) to trigger an immediate keyframe
-            for _ in range(4):
+            for _ in range(6):
                 if frame_future.done():
                     break
                 try:
-                    if remote_ssrc and hasattr(transceiver, "receiver") and transceiver.receiver:
-                        await transceiver.receiver._send_rtcp_pli(remote_ssrc)
+                    r = transceiver.receiver
+                    local_ssrc = getattr(r, "_RTCRtpReceiver__rtcp_ssrc", None)
+                    if remote_ssrc and local_ssrc and hasattr(r, "_send_rtcp"):
+                        remb_fci = pack_remb_fci(2_500_000, [remote_ssrc])
+                        remb_pkt = RtcpPsfbPacket(fmt=15, ssrc=local_ssrc, media_ssrc=0, fci=remb_fci)
+                        await r._send_rtcp(remb_pkt)
+                        await r._send_rtcp_pli(remote_ssrc)
                 except Exception:
                     pass
                 await asyncio.sleep(0.8)
@@ -266,7 +271,6 @@ async def async_capture_webrtc_snapshot(
                 nonlocal remote_ssrc
                 async for ws_msg in ws:
                     if ws_msg.type == aiohttp.WSMsgType.TEXT:
-                        # AWS Kinesis sends empty text messages as heartbeats; skip them safely
                         if not ws_msg.data or not ws_msg.data.strip():
                             continue
                         try:
