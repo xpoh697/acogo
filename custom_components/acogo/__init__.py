@@ -244,6 +244,63 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         supports_response=SupportsResponse.OPTIONAL,
     )
 
+    # Register capture_snapshot service for Telegram automations
+    async def async_handle_capture_snapshot(call: ServiceCall) -> dict[str, Any]:
+        """Capture a snapshot from acoGO camera and save to disk."""
+        device_id = call.data.get("device_id") or next(iter(coordinator.data), None)
+        if not device_id:
+            raise HomeAssistantError("Intercom device not found")
+
+        raw_filename = call.data.get("filename", "/config/www/doorbell_latest.jpg")
+        timeout = float(call.data.get("timeout", 5.0))
+
+        # Safe directory path resolution
+        if hass.config.is_allowed_path(raw_filename):
+            target_path = Path(raw_filename)
+        else:
+            safe_name = Path(raw_filename).name or "doorbell_latest.jpg"
+            target_path = Path(hass.config.path("www", safe_name))
+
+        # Ensure parent directory exists
+        await hass.async_add_executor_job(target_path.parent.mkdir, 0o755, True, True)
+
+        params = await coordinator.async_start_preview(device_id)
+        aws = params.get("aws", {})
+        if not isinstance(aws, dict):
+            raise HomeAssistantError("AWS credentials not available from cloud preview")
+
+        from .webrtc import async_capture_webrtc_snapshot, generate_snapshot_fallback_card
+        jpeg_bytes = await async_capture_webrtc_snapshot(session, aws, timeout=timeout)
+
+        if not jpeg_bytes:
+            info = coordinator.data.get(device_id, {}).get("info", {})
+            panel_name = info.get("name", f"acoGO {device_id}")
+            jpeg_bytes = await hass.async_add_executor_job(generate_snapshot_fallback_card, panel_name)
+
+        def _write_file(p: Path, data: bytes) -> None:
+            with open(p, "wb") as f:
+                f.write(data)
+
+        await hass.async_add_executor_job(_write_file, target_path, jpeg_bytes)
+
+        is_ringing = coordinator.data.get(device_id, {}).get("ringing", False)
+        if not is_ringing:
+            await coordinator.async_stop_preview(device_id)
+
+        _LOGGER.info("Saved acoGO snapshot to %s (%d bytes)", target_path, len(jpeg_bytes))
+        return {
+            "success": True,
+            "filename": str(target_path),
+            "bytes": len(jpeg_bytes),
+        }
+
+    hass.services.async_register(
+        DOMAIN,
+        "capture_snapshot",
+        async_handle_capture_snapshot,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
@@ -261,4 +318,5 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not hass.data[DOMAIN]:
             hass.services.async_remove(DOMAIN, "start_webrtc_stream")
             hass.services.async_remove(DOMAIN, "stop_webrtc_stream")
+            hass.services.async_remove(DOMAIN, "capture_snapshot")
     return unload_ok

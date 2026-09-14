@@ -1,0 +1,49 @@
+capture_snapshot:
+  name: Сделать снимок с камеры
+  description: Захватывает мгновенный JPEG-кадр с камеры домофона acoGO и сохраняет его на диск (например, для отправки в Telegram при звонке).
+  fields:
+    device_id:
+      name: ID устройства
+      description: devId домофона (если не указан, берется первый доступный домофон).
+      example: "01:01:26:79"
+      selector:
+        text:
+    filename:
+      name: Путь к файлу
+      description: Путь к JPEG-файлу для сохранения (рекомендуется в /config/www/ для доступа Telegram).
+      default: "/config/www/doorbell_latest.jpg"
+      example: "/config/www/doorbell_latest.jpg"
+      selector:
+        text:
+    timeout:
+      name: Таймаут (сек)
+      description: Максимальное время ожидания кадра (по умолчанию 5 секунд).
+      default: 5.0
+      selector:
+        number:
+          min: 2
+          max: 15
+          step: 1
+          unit_of_measurement: seconds
+
+start_webrtc_stream:
+  name: Начать WebRTC поток
+  description: Инициирует KVS WebRTC сессию и возвращает подписанный WSS URL и ICE-серверы для карточки Lovelace.
+  fields:
+    device_id:
+      name: ID устройства
+      description: devId домофона.
+      example: "01:01:26:79"
+      selector:
+        text:
+
+stop_webrtc_stream:
+  name: Остановить WebRTC поток
+  description: Завершает видеотрансляцию и освобождает линию домофона.
+  fields:
+    device_id:
+      name: ID устройства
+      description: devId домофона.
+      example: "01:01:26:79"
+      selector:
+        text:

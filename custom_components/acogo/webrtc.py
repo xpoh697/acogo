@@ -149,6 +149,15 @@ async def fetch_ice_servers(session: Any, aws: dict[str, Any]) -> list[Any]:
     return fallback_servers
 
 
+def is_private_ip(ip_str: str) -> bool:
+    """Return True if IP is RFC1918 private, loopback, or link-local."""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        return ip.is_private or ip.is_loopback or ip.is_link_local
+    except ValueError:
+        return False
+
+
 def filter_private_candidates(sdp: str) -> str:
     """Filter out RFC1918 private host candidates to avoid AWS TURN 403 Forbidden IP errors."""
     clean_lines = []
@@ -156,21 +165,66 @@ def filter_private_candidates(sdp: str) -> str:
         if line.startswith("a=candidate:"):
             parts = line.split()
             if len(parts) >= 8 and parts[7] == "host":
-                ip_str = parts[4]
-                try:
-                    ip = ipaddress.ip_address(ip_str)
-                    if ip.is_private or ip.is_loopback or ip.is_link_local:
-                        continue
-                except ValueError:
-                    pass
+                if is_private_ip(parts[4]):
+                    continue
         clean_lines.append(line)
     return "\r\n".join(clean_lines) + "\r\n"
+
+
+def generate_snapshot_fallback_card(panel_name: str) -> bytes:
+    """Generate an informative JPEG card when direct WebRTC frame capture is buffering."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+
+        width, height = 1280, 720
+        img = Image.new("RGB", (width, height), color=(15, 23, 42))
+        draw = ImageDraw.Draw(img)
+
+        try:
+            font_title = ImageFont.load_default(size=26)
+            font_big = ImageFont.load_default(size=36)
+            font_sub = ImageFont.load_default(size=22)
+            font_small = ImageFont.load_default(size=18)
+        except Exception:
+            font_title = font_big = font_sub = font_small = ImageFont.load_default()
+
+        # Header bar
+        draw.rectangle([0, 0, width, 68], fill=(10, 15, 28))
+        draw.text((32, 22), f"ACO INTERCOM - {panel_name.upper()}", fill=(255, 255, 255), font=font_title)
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        draw.text((width - 260, 22), now_str, fill=(148, 163, 184), font=font_title)
+
+        # Central icon
+        cx, cy = width // 2, height // 2 - 20
+        draw.ellipse([cx - 100, cy - 100, cx + 100, cy + 100], fill=(30, 41, 59), outline=(2, 132, 199), width=3)
+        draw.ellipse([cx - 60, cy - 60, cx + 60, cy + 60], fill=(15, 23, 42), outline=(245, 158, 11), width=2)
+        draw.ellipse([cx - 20, cy - 20, cx + 20, cy + 20], fill=(245, 158, 11))
+
+        # Status text
+        status_text = "ВХОДЯЩИЙ ЗВОНОК В ДОМОФОН"
+        draw.text((cx - 280, cy + 130), status_text, fill=(245, 158, 11), font=font_big)
+
+        sub_text = "Нажмите 'Включить камеру' на карточке в Home Assistant для просмотра живого видео 30 FPS"
+        draw.text((cx - 420, cy + 180), sub_text, fill=(148, 163, 184), font=font_sub)
+
+        # Footer bar
+        draw.rectangle([0, height - 50, width, height], fill=(10, 15, 28))
+        draw.text((32, height - 35), "acoGO! Home Assistant Integration", fill=(100, 116, 139), font=font_small)
+        draw.text((width - 320, height - 35), "WebRTC Kinesis Live Stream", fill=(16, 185, 129), font=font_small)
+
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        return buf.getvalue()
+    except Exception as err:
+        _LOGGER.debug("Error creating snapshot fallback card: %s", err)
+        # Minimal 1x1 black JPEG fallback
+        return b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xdb\x00C\x00\x08\x06\x06\x07\x06\x05\x08\x07\x07\x07\t\t\x08\n\x0c\x14\r\x0c\x0b\x0b\x0c\x19\x12\x13\x0f\x14\x1d\x1a\x1f\x1e\x1d\x1a\x1c\x1c $.' \",#\x1c\x1c(7),01444\x1f'9=82<.342\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00\xff\xc4\x00\x1f\x00\x00\x01\x05\x01\x01\x01\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\xff\xda\x00\x08\x01\x01\x00\x00?\x00\xbf\x00\xff\xd9"
 
 
 async def async_capture_webrtc_snapshot(
     session: Any,
     aws: dict[str, Any],
-    timeout: float = 18.0,
+    timeout: float = 6.0,
 ) -> bytes | None:
     """Connect as WebRTC viewer to AWS KVS, receive 1 video frame, and return JPEG bytes."""
     try:
@@ -180,7 +234,7 @@ async def async_capture_webrtc_snapshot(
             RTCPeerConnection,
             RTCSessionDescription,
         )
-        from aiortc.sdp import candidate_from_sdp
+        from aiortc.sdp import candidate_from_sdp, candidate_to_sdp
         from aiortc.rtp import RtcpPsfbPacket
         from aiortc.rtcrtpreceiver import pack_remb_fci
     except ImportError:
@@ -219,7 +273,7 @@ async def async_capture_webrtc_snapshot(
     @pc.on("connectionstatechange")
     async def on_connection_state_change() -> None:
         if pc.connectionState == "connected":
-            for _ in range(6):
+            for _ in range(4):
                 if frame_future.done():
                     break
                 try:
@@ -232,10 +286,30 @@ async def async_capture_webrtc_snapshot(
                         await r._send_rtcp_pli(remote_ssrc)
                 except Exception:
                     pass
-                await asyncio.sleep(0.8)
+                await asyncio.sleep(0.5)
 
     try:
-        async with session.ws_connect(signed_url, timeout=aiohttp.ClientTimeout(total=8.0)) as ws:
+        async with session.ws_connect(signed_url, timeout=aiohttp.ClientTimeout(total=6.0)) as ws:
+            @pc.on("icecandidate")
+            async def on_ice_candidate(candidate: Any) -> None:
+                if candidate:
+                    if is_private_ip(candidate.ip):
+                        return
+                    cand_str = f"candidate:{candidate_to_sdp(candidate)}"
+                    cand_dict = {
+                        "candidate": cand_str,
+                        "sdpMid": candidate.sdpMid,
+                        "sdpMLineIndex": candidate.sdpMLineIndex,
+                    }
+                    c_msg = {
+                        "action": "ICE_CANDIDATE",
+                        "messagePayload": base64.b64encode(json.dumps(cand_dict).encode()).decode(),
+                    }
+                    try:
+                        await ws.send_str(json.dumps(c_msg))
+                    except Exception:
+                        pass
+
             offer = await pc.createOffer()
             await pc.setLocalDescription(offer)
 
@@ -249,23 +323,6 @@ async def async_capture_webrtc_snapshot(
                 "messagePayload": base64.b64encode(json.dumps(offer_payload).encode()).decode(),
             }
             await ws.send_str(json.dumps(msg))
-
-            @pc.on("icecandidate")
-            async def on_ice_candidate(candidate: Any) -> None:
-                if candidate:
-                    cand_dict = {
-                        "candidate": candidate.candidate,
-                        "sdpMid": candidate.sdpMid,
-                        "sdpMLineIndex": candidate.sdpMLineIndex,
-                    }
-                    c_msg = {
-                        "action": "ICE_CANDIDATE",
-                        "messagePayload": base64.b64encode(json.dumps(cand_dict).encode()).decode(),
-                    }
-                    try:
-                        await ws.send_str(json.dumps(c_msg))
-                    except Exception:
-                        pass
 
             async def _read_signaling() -> None:
                 nonlocal remote_ssrc
@@ -289,13 +346,15 @@ async def async_capture_webrtc_snapshot(
                                 )
                             elif mtype == "ICE_CANDIDATE":
                                 payload = json.loads(base64.b64decode(raw["messagePayload"]).decode())
-                                cand_str = payload.get("candidate")
+                                cand_str = payload.get("candidate", "")
                                 if cand_str:
+                                    clean_c_str = re.sub(r"^candidate:\s*", "", cand_str)
                                     try:
-                                        c = candidate_from_sdp(cand_str)
+                                        c = candidate_from_sdp(clean_c_str)
                                         c.sdpMid = payload.get("sdpMid")
                                         c.sdpMLineIndex = payload.get("sdpMLineIndex")
-                                        await pc.addIceCandidate(c)
+                                        if not is_private_ip(c.ip):
+                                            await pc.addIceCandidate(c)
                                     except Exception:
                                         pass
                         except Exception as e:
