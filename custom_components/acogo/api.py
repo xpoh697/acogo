@@ -225,9 +225,9 @@ class AcoGoApiClient:
             await self._request("POST", "/order/video-sw", json={"targetId": target_id})
             return True
 
-    async def request_preview(self, device_id: str) -> dict[str, Any]:
+    async def request_preview(self, device_id: str, preview_type: str = "audio-video") -> dict[str, Any]:
         """Request live WebRTC/Kinesis video preview session."""
-        res = await self._request("POST", "/preview/request", json={"devId": device_id, "previewType": "video-only"})
+        res = await self._request("POST", "/preview/request", json={"devId": device_id, "previewType": preview_type})
         return res if isinstance(res, dict) else {}
 
     async def end_preview(self) -> bool:

@@ -148,12 +148,37 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
         elif not is_streaming and not is_ringing and self._bg_task and not self._bg_task.done():
             self._bg_task.cancel()
             self._bg_task = None
-            self._last_image = None
 
     async def _async_background_capture_loop(self) -> None:
-        """Background worker that captures real frames over WebRTC while preview or ringing is active."""
+        """Background worker that captures real frames over WebRTC with fail-fast timeout protection."""
+        max_attempts = 2
+        attempt = 0
         try:
             while self.coordinator.is_preview_active(self.dev_id) or self.coordinator.data.get(self.dev_id, {}).get("ringing", False):
+                attempt += 1
+                if attempt > max_attempts:
+                    _LOGGER.info(
+                        "WebRTC capture reached limit (%s attempts) without video feed for %s. Auto-releasing session.",
+                        max_attempts,
+                        self.dev_id,
+                    )
+                    info = self.coordinator.data.get(self.dev_id, {}).get("info", {})
+                    panel_name = info.get("name", f"acoGO {self.dev_id}")
+                    timeout_card = await self.hass.async_add_executor_job(
+                        self._generate_camera_card,
+                        panel_name,
+                        "timeout",
+                        False,
+                        False,
+                        "TIMEOUT (NO VIDEO FEED)",
+                        "Intercom did not send video feed within 25s | Session auto-closed",
+                    )
+                    self._last_image = timeout_card
+                    self.async_write_ha_state()
+                    # Automatically turn off preview to reset switch and release intercom line
+                    await self.coordinator.async_stop_preview(self.dev_id)
+                    break
+
                 params = self.coordinator.get_preview_params(self.dev_id)
                 if params and isinstance(params.get("aws"), dict):
                     from .webrtc import async_capture_webrtc_snapshot
@@ -161,7 +186,7 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
                     frame_bytes = await async_capture_webrtc_snapshot(
                         session=session,
                         aws=params["aws"],
-                        timeout=18.0,
+                        timeout=11.0,
                     )
                     if frame_bytes:
                         _LOGGER.info("Successfully received camera frame from acoGO WebRTC")
@@ -169,7 +194,7 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
                         self.async_write_ha_state()
                         await asyncio.sleep(1.0)
                         continue
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(1.0)
         except asyncio.CancelledError:
             pass
         except Exception as err:
@@ -188,7 +213,6 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
         if self._bg_task and not self._bg_task.done():
             self._bg_task.cancel()
             self._bg_task = None
-        self._last_image = None
         await self.coordinator.async_stop_preview(self.dev_id)
 
     def _get_font(self, size: int) -> Any:
@@ -213,6 +237,8 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
         status: str,
         is_ringing: bool,
         is_streaming: bool,
+        custom_status: str | None = None,
+        custom_sub: str | None = None,
     ) -> bytes:
         """Render informative camera status card synchronously with clean typography."""
         try:
@@ -235,7 +261,11 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
             draw.text((width - 270, 20), now_str, fill=(180, 190, 205), font=font_title)
 
             cx, cy = width // 2, height // 2 - 30
-            if is_ringing:
+            if custom_status:
+                lens_outer = (58, 30, 20)
+                lens_ring = (255, 120, 50)
+                lens_center = (255, 130, 60)
+            elif is_ringing:
                 lens_outer = (58, 24, 24)
                 lens_ring = (255, 75, 75)
                 lens_center = (255, 80, 80)
@@ -252,7 +282,11 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
             draw.ellipse([cx - 70, cy - 70, cx + 70, cy + 70], fill=(15, 20, 32), outline=lens_ring, width=2)
             draw.ellipse([cx - 24, cy - 24, cx + 24, cy + 24], fill=lens_center)
 
-            if is_ringing:
+            if custom_status:
+                status_text = custom_status
+                status_color = (255, 120, 50)
+                sub_text = custom_sub or "WebRTC session auto-released"
+            elif is_ringing:
                 status_text = "INCOMING CALL (RINGING)"
                 status_color = (255, 75, 75)
                 sub_text = "Call in Progress | Doorbell is Ringing"
@@ -277,8 +311,15 @@ class AcoGoCamera(CoordinatorEntity[AcoGoDataUpdateCoordinator], Camera):
 
             draw.rectangle([0, height - 54, width, height], fill=(10, 14, 22))
             draw.text((32, height - 38), "acoGO! Home Assistant Integration", fill=(100, 120, 145), font=font_small)
-            footer_right = "Stream: CONNECTING" if is_streaming else "Door Lock: Ready | Gate: Ready"
-            footer_color = (255, 170, 0) if is_streaming else (140, 160, 185)
+            if custom_status:
+                footer_right = "Stream: TIMEOUT"
+                footer_color = (255, 120, 50)
+            elif is_streaming:
+                footer_right = "Stream: CONNECTING"
+                footer_color = (255, 170, 0)
+            else:
+                footer_right = "Door Lock: Ready | Gate: Ready"
+                footer_color = (140, 160, 185)
             draw.text((width - 320, height - 38), footer_right, fill=footer_color, font=font_small)
 
             buf = io.BytesIO()

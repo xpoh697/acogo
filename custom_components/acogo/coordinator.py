@@ -11,12 +11,9 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import AcoGoApiClient, AcoGoApiError
-from .const import DOMAIN
+from .const import DOMAIN, PREVIEW_WATCHDOG_TIMEOUT
 
 _LOGGER = logging.getLogger(__name__)
-
-# Auto-close preview after 3 minutes (180s) to prevent intercom line starvation
-PREVIEW_WATCHDOG_TIMEOUT = 180.0
 
 
 class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -35,6 +32,11 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_start_preview(self, dev_id: str) -> dict[str, Any]:
         """Start live preview session for intercom device with watchdog protection."""
+        # Singleton check: reuse active preview parameters if already active
+        if dev_id in self.preview_active_devices and self.preview_active_devices[dev_id]:
+            _LOGGER.debug("Reusing active preview session for %s", dev_id)
+            return self.preview_active_devices[dev_id]
+
         try:
             resp = await self.api.request_preview(dev_id)
         except AcoGoApiError as err:
@@ -47,7 +49,7 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if dev_id in self._preview_watchdog_handles:
             self._preview_watchdog_handles[dev_id].cancel()
 
-        # Schedule automatic shutdown watchdog (180s)
+        # Schedule automatic shutdown watchdog (45s)
         loop = self.hass.loop
         self._preview_watchdog_handles[dev_id] = loop.call_later(
             PREVIEW_WATCHDOG_TIMEOUT,
@@ -94,11 +96,14 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     prev_state = self.data.get(dev_id, {}).get("state", "ready") if self.data else "ready"
                     state_resp = prev_state
 
+                # Line is ringing if busy and not currently in user preview session
+                is_ringing = (state_resp == "busy" and not self.is_preview_active(dev_id))
+
                 devices_data[dev_id] = {
                     "info": dev,
                     "state": state_resp,  # 'ready', 'busy', 'offline'
                     "is_online": (state_resp != "offline"),
-                    "is_ringing": (state_resp == "busy"),
+                    "is_ringing": is_ringing,
                 }
 
             return devices_data
