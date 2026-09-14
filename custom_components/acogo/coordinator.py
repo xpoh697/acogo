@@ -41,7 +41,12 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def start_line_monitor(self) -> None:
         """Start the high-frequency line state monitor task if not already running."""
         if self._line_monitor_task is None or self._line_monitor_task.done():
-            self._line_monitor_task = self.hass.async_create_task(self._async_line_monitor_loop())
+            if hasattr(self.hass, "async_create_background_task"):
+                self._line_monitor_task = self.hass.async_create_background_task(
+                    self._async_line_monitor_loop(), "acogo_line_monitor"
+                )
+            else:
+                self._line_monitor_task = self.hass.loop.create_task(self._async_line_monitor_loop())
 
     def stop_line_monitor(self) -> None:
         """Stop line state monitor task."""

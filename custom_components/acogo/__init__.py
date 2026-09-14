@@ -143,7 +143,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         async def _register_card_after_start(event: Any) -> None:
             await _async_register_card(hass)
 
-        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _register_card_after_start)
+        entry.async_on_unload(
+            hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _register_card_after_start)
+        )
 
     # Automatically clean up deprecated camera, switch, and preview button entities from entity registry
     ent_reg = er.async_get(hass)
@@ -179,8 +181,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = AcoGoDataUpdateCoordinator(hass, client)
     await coordinator.async_config_entry_first_refresh()
 
-    # Start high-frequency line monitor for instant doorbell call detection
-    coordinator.start_line_monitor()
+    # Start high-frequency line monitor safely without blocking HA startup
+    if hass.state == CoreState.running:
+        coordinator.start_line_monitor()
+    else:
+        async def _start_line_monitor_after_ha_started(event: Any) -> None:
+            coordinator.start_line_monitor()
+
+        entry.async_on_unload(
+            hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _start_line_monitor_after_ha_started)
+        )
 
     hass.data[DOMAIN][entry.entry_id] = {
         "coordinator": coordinator,

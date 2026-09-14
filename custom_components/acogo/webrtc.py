@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from dataclasses import dataclass, field
 import datetime
 import hashlib
 import hmac
@@ -17,6 +18,15 @@ import urllib.parse
 from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class RTCIceServer:
+    """Lightweight ICE server configuration container (zero external dependencies)."""
+
+    urls: list[str] = field(default_factory=list)
+    username: str | None = None
+    credential: str | None = None
 
 
 def _sign(key: bytes, msg: str) -> bytes:
@@ -77,10 +87,8 @@ def generate_signed_wss_url(aws: dict[str, Any], client_id: str) -> str:
     return f"{wss_endpoint}/?{canonical_querystr}&X-Amz-Signature={signature}"
 
 
-async def fetch_ice_servers(session: Any, aws: dict[str, Any]) -> list[Any]:
-    """Fetch dynamic AWS KVS STUN/TURN server configurations via SigV4."""
-    from aiortc import RTCIceServer
-
+async def fetch_ice_servers(session: Any, aws: dict[str, Any]) -> list[RTCIceServer]:
+    """Fetch dynamic AWS KVS STUN/TURN server configurations via SigV4 without external dependencies."""
     access_key = aws.get("access key ID", "")
     secret_key = aws.get("secret access key ID", "")
     session_token = aws.get("session token")
@@ -170,6 +178,38 @@ def filter_private_candidates(sdp: str) -> str:
                 if is_private_ip(parts[4]):
                     continue
         clean_lines.append(line)
+    return "\r\n".join(clean_lines) + "\r\n"
+
+
+def filter_relay_only_candidates(sdp: str) -> str:
+    """Filter SDP to keep only relay (TURN) candidates, dropping host/srflx/prflx.
+
+    This forces ICE to use only TURN relay transport, matching the behavior
+    of the official acoGO app: iceTransportPolicy: 'relay'.
+    """
+    clean_lines = []
+    dropped = 0
+    kept = 0
+    for line in sdp.splitlines():
+        if line.startswith("a=candidate:"):
+            # SDP candidate format: a=candidate:foundation component transport priority ip port typ <type> ...
+            parts = line.split()
+            # Find 'typ' keyword and check the type after it
+            try:
+                typ_idx = parts.index("typ")
+                cand_type = parts[typ_idx + 1] if typ_idx + 1 < len(parts) else ""
+            except (ValueError, IndexError):
+                cand_type = ""
+            if cand_type != "relay":
+                dropped += 1
+                continue
+            kept += 1
+        clean_lines.append(line)
+    if dropped > 0:
+        _LOGGER.debug(
+            "SDP relay filter: kept %d relay candidates, dropped %d non-relay",
+            kept, dropped,
+        )
     return "\r\n".join(clean_lines) + "\r\n"
 
 
@@ -278,16 +318,77 @@ def generate_snapshot_fallback_card(panel_name: str) -> bytes:
         return b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xdb\x00C\x00\x08\x06\x06\x07\x06\x05\x08\x07\x07\x07\t\t\x08\n\x0c\x14\r\x0c\x0b\x0b\x0c\x19\x12\x13\x0f\x14\x1d\x1a\x1f\x1e\x1d\x1a\x1c\x1c $.' \",#\x1c\x1c(7),01444\x1f'9=82<.342\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00\xff\xc4\x00\x1f\x00\x00\x01\x05\x01\x01\x01\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\xff\xda\x00\x08\x01\x01\x00\x00?\x00\xbf\x00\xff\xd9"
 
 
+def _enable_relay_only_transport() -> object:
+    """Temporarily monkey-patch aiortc to force relay-only ICE transport.
+
+    Returns a restore token — call _disable_relay_only_transport(token) when done.
+
+    How it works:
+    - aiortc.RTCIceGatherer creates aioice.Connection via connection_kwargs()
+    - aioice.Connection already supports transport_policy=TransportPolicy.RELAY
+    - But aiortc never passes it. We patch connection_kwargs to inject it.
+    - We also patch add_remote_candidate to filter non-relay remote candidates.
+
+    This is the same behavior as the official acoGO app:
+    iceTransportPolicy: isWifiConnected ? "all" : "relay"
+    """
+    try:
+        import aiortc.rtcicetransport as ice_mod
+        from aioice.ice import TransportPolicy
+
+        original_connection_kwargs = ice_mod.connection_kwargs
+
+        def _relay_connection_kwargs(servers):
+            kwargs = original_connection_kwargs(servers)
+            kwargs["transport_policy"] = TransportPolicy.RELAY
+            _LOGGER.debug("ICE transport policy forced to RELAY (relay-only mode)")
+            return kwargs
+
+        ice_mod.connection_kwargs = _relay_connection_kwargs
+        _LOGGER.debug("Relay-only monkey-patch applied to aiortc.rtcicetransport.connection_kwargs")
+        return original_connection_kwargs
+    except Exception as err:
+        _LOGGER.warning("Failed to apply relay-only transport patch: %s", err)
+        return None
+
+
+def _disable_relay_only_transport(restore_token: object) -> None:
+    """Restore original aiortc connection_kwargs after relay-only session."""
+    if restore_token is not None:
+        try:
+            import aiortc.rtcicetransport as ice_mod
+            ice_mod.connection_kwargs = restore_token
+            _LOGGER.debug("Relay-only monkey-patch removed, connection_kwargs restored")
+        except Exception as err:
+            _LOGGER.warning("Failed to restore connection_kwargs: %s", err)
+
+
+def _is_relay_candidate_str(cand_str: str) -> bool:
+    """Check if a candidate string (raw SDP or clean) represents a relay candidate."""
+    parts = cand_str.split()
+    try:
+        typ_idx = parts.index("typ")
+        return parts[typ_idx + 1] == "relay" if typ_idx + 1 < len(parts) else False
+    except (ValueError, IndexError):
+        return False
+
+
 async def async_capture_webrtc_snapshot(
     session: Any,
     aws: dict[str, Any],
     timeout: float = 10.0,
 ) -> bytes | None:
-    """Connect as WebRTC viewer to AWS KVS, receive 1 video frame, and return JPEG bytes."""
+    """Connect as WebRTC viewer to AWS KVS, receive 1 video frame, and return JPEG bytes.
+
+    Uses relay-only ICE transport to match the official acoGO app behavior.
+    The ACO intercom sends RTP exclusively through TURN relay, so direct
+    srflx/host connections result in 0 RTP packets despite ICE 'completed' state.
+    """
     try:
         import aiohttp
         from aiortc import (
             RTCConfiguration,
+            RTCIceServer as AiortcIceServer,
             RTCPeerConnection,
             RTCSessionDescription,
         )
@@ -295,14 +396,27 @@ async def async_capture_webrtc_snapshot(
         from aiortc.rtp import RtcpPsfbPacket
         from aiortc.rtcrtpreceiver import pack_remb_fci
     except ImportError:
-        _LOGGER.warning("aiortc or aiohttp not available for acoGO WebRTC capture")
+        _LOGGER.debug("aiortc or aiohttp not available for acoGO WebRTC capture")
         return None
+
+    # Apply relay-only transport patch BEFORE creating RTCPeerConnection
+    relay_restore_token = _enable_relay_only_transport()
 
     client_id = "HAViewer" + hashlib.md5(str(datetime.datetime.now().timestamp()).encode()).hexdigest()[:10]
     signed_url = generate_signed_wss_url(aws, client_id)
 
-    ice_servers = await fetch_ice_servers(session, aws)
-    config = RTCConfiguration(iceServers=ice_servers)
+    ice_servers_raw = await fetch_ice_servers(session, aws)
+    _LOGGER.debug(
+        "ICE servers fetched: %d total (%s)",
+        len(ice_servers_raw),
+        ", ".join(s.urls[0] if s.urls else "?" for s in ice_servers_raw),
+    )
+
+    rtc_ice_servers = [
+        AiortcIceServer(urls=s.urls, username=s.username, credential=s.credential)
+        for s in ice_servers_raw
+    ]
+    config = RTCConfiguration(iceServers=rtc_ice_servers)
     pc = RTCPeerConnection(configuration=config)
     transceiver = pc.addTransceiver("video", direction="recvonly")
 
@@ -312,9 +426,15 @@ async def async_capture_webrtc_snapshot(
     @pc.on("track")
     def on_track(track: Any) -> None:
         if track.kind == "video":
+            _LOGGER.debug("Video track received from intercom")
+
             async def _recv_frame() -> None:
                 try:
                     frame = await asyncio.wait_for(track.recv(), timeout=timeout)
+                    _LOGGER.debug(
+                        "Video frame captured: %dx%d",
+                        frame.width, frame.height,
+                    )
                     img = frame.to_image()
                     buf = io.BytesIO()
                     img.save(buf, format="JPEG", quality=85)
@@ -322,6 +442,7 @@ async def async_capture_webrtc_snapshot(
                     if not frame_future.done():
                         frame_future.set_result(jpeg_bytes)
                 except Exception as err:
+                    _LOGGER.debug("Frame recv error: %s", err)
                     if not frame_future.done():
                         frame_future.set_exception(err)
 
@@ -329,7 +450,25 @@ async def async_capture_webrtc_snapshot(
 
     @pc.on("connectionstatechange")
     async def on_connection_state_change() -> None:
+        _LOGGER.debug("PC connection state: %s", pc.connectionState)
         if pc.connectionState == "connected":
+            # Log the nominated ICE pair details for diagnostics
+            try:
+                ice_transport = transceiver.receiver.transport.transport
+                ice_conn = ice_transport._connection
+                for comp, pair in ice_conn._nominated.items():
+                    local_c = pair.protocol.local_candidate
+                    remote_c = pair.remote_candidate
+                    _LOGGER.debug(
+                        "Nominated ICE pair [comp=%d]: local=%s:%d (%s) -> remote=%s:%d (%s)",
+                        comp,
+                        local_c.host, local_c.port, local_c.type,
+                        remote_c.host, remote_c.port, remote_c.type,
+                    )
+            except Exception:
+                pass
+
+            # Send REMB/PLI to request keyframes
             for _ in range(4):
                 if frame_future.done():
                     break
@@ -350,8 +489,18 @@ async def async_capture_webrtc_snapshot(
             @pc.on("icecandidate")
             async def on_ice_candidate(candidate: Any) -> None:
                 if candidate:
-                    if is_private_ip(candidate.ip):
+                    # In relay-only mode, only relay candidates should be gathered
+                    # but double-check just in case
+                    if candidate.type != "relay":
+                        _LOGGER.debug(
+                            "Dropping local non-relay candidate: %s:%d (%s)",
+                            candidate.ip, candidate.port, candidate.type,
+                        )
                         return
+                    _LOGGER.debug(
+                        "Sending local relay candidate: %s:%d",
+                        candidate.ip, candidate.port,
+                    )
                     cand_str = f"candidate:{candidate_to_sdp(candidate)}"
                     cand_dict = {
                         "candidate": cand_str,
@@ -370,7 +519,12 @@ async def async_capture_webrtc_snapshot(
             offer = await pc.createOffer()
             await pc.setLocalDescription(offer)
 
-            filtered_offer_sdp = filter_private_candidates(pc.localDescription.sdp)
+            # Restore monkey-patch immediately after gathering completes
+            _disable_relay_only_transport(relay_restore_token)
+            relay_restore_token = None
+
+            # Filter offer SDP to relay-only candidates
+            filtered_offer_sdp = filter_relay_only_candidates(pc.localDescription.sdp)
             offer_payload = {
                 "type": pc.localDescription.type,
                 "sdp": filtered_offer_sdp,
@@ -380,6 +534,7 @@ async def async_capture_webrtc_snapshot(
                 "messagePayload": base64.b64encode(json.dumps(offer_payload).encode()).decode(),
             }
             await ws.send_str(json.dumps(msg))
+            _LOGGER.debug("SDP offer sent (relay-only candidates)")
 
             async def _read_signaling() -> None:
                 nonlocal remote_ssrc
@@ -397,21 +552,33 @@ async def async_capture_webrtc_snapshot(
                                 if ssrc_match:
                                     remote_ssrc = int(ssrc_match.group(1))
 
-                                sanitized_sdp = filter_private_candidates(sdp_text)
+                                # Filter answer SDP to relay-only remote candidates
+                                relay_sdp = filter_relay_only_candidates(sdp_text)
+                                _LOGGER.debug("SDP answer received, applying relay-only filter")
                                 await pc.setRemoteDescription(
-                                    RTCSessionDescription(sdp=sanitized_sdp, type=payload["type"])
+                                    RTCSessionDescription(sdp=relay_sdp, type=payload["type"])
                                 )
                             elif mtype == "ICE_CANDIDATE":
                                 payload = json.loads(base64.b64decode(raw["messagePayload"]).decode())
                                 cand_str = payload.get("candidate", "")
                                 if cand_str:
                                     clean_c_str = re.sub(r"^candidate:\s*", "", cand_str)
+                                    # Only accept relay remote candidates
+                                    if not _is_relay_candidate_str(clean_c_str):
+                                        _LOGGER.debug(
+                                            "Dropping non-relay remote ICE candidate: %s",
+                                            clean_c_str[:80],
+                                        )
+                                        continue
                                     try:
                                         c = candidate_from_sdp(clean_c_str)
                                         c.sdpMid = payload.get("sdpMid")
                                         c.sdpMLineIndex = payload.get("sdpMLineIndex")
-                                        if not is_private_ip(c.ip):
-                                            await pc.addIceCandidate(c)
+                                        _LOGGER.debug(
+                                            "Adding remote relay candidate: %s:%d",
+                                            c.ip, c.port,
+                                        )
+                                        await pc.addIceCandidate(c)
                                     except Exception:
                                         pass
                         except Exception as e:
@@ -423,17 +590,21 @@ async def async_capture_webrtc_snapshot(
 
             try:
                 jpeg_data = await asyncio.wait_for(frame_future, timeout=timeout)
+                _LOGGER.debug("WebRTC snapshot captured successfully (%d bytes)", len(jpeg_data))
                 return jpeg_data
             finally:
                 signaling_task.cancel()
 
     except asyncio.TimeoutError:
-        _LOGGER.debug("Timeout waiting for WebRTC video frame from acoGO panel")
+        _LOGGER.debug("Timeout waiting for WebRTC video frame from acoGO panel (relay-only mode)")
         return None
     except Exception as err:
         _LOGGER.debug("WebRTC snapshot capture error: %s", err)
         return None
     finally:
+        # Ensure monkey-patch is always restored even on exceptions
+        if relay_restore_token is not None:
+            _disable_relay_only_transport(relay_restore_token)
         try:
             await pc.close()
         except Exception:

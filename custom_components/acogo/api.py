@@ -20,6 +20,8 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+API_TIMEOUT = aiohttp.ClientTimeout(total=10.0, connect=5.0)
+
 
 class AcoGoApiError(Exception):
     """General ACO GO API exception."""
@@ -98,7 +100,7 @@ class AcoGoApiClient:
         }
 
         try:
-            async with self.session.post(url, json=payload, headers=headers, timeout=15) as resp:
+            async with self.session.post(url, json=payload, headers=headers, timeout=API_TIMEOUT) as resp:
                 if resp.status == 401:
                     raise AcoGoAuthError("Invalid credentials")
                 if resp.status not in (200, 201):
@@ -138,7 +140,7 @@ class AcoGoApiClient:
     async def _request(self, method: str, path: str, json: Any = None) -> Any:
         url = f"{BASE_URL}{path}"
         try:
-            async with self.session.request(method, url, json=json, headers=self._get_headers(), timeout=15) as resp:
+            async with self.session.request(method, url, json=json, headers=self._get_headers(), timeout=API_TIMEOUT) as resp:
                 if resp.status == 401:
                     # Specific check: 401 on /order/video-sw is a feature authorization rejection
                     # (device lacks PRO multi-camera hardware/license), NOT an expired token!
@@ -158,7 +160,7 @@ class AcoGoApiClient:
                                 await self.register_device()
 
                         # Retry with refreshed password
-                        async with self.session.request(method, url, json=json, headers=self._get_headers(), timeout=15) as retry_resp:
+                        async with self.session.request(method, url, json=json, headers=self._get_headers(), timeout=API_TIMEOUT) as retry_resp:
                             if retry_resp.status not in (200, 201):
                                 text = await retry_resp.text()
                                 raise AcoGoApiError(f"Request failed after re-auth: {retry_resp.status} on {path}: {text}")
