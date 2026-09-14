@@ -1,7 +1,7 @@
 /**
  * acoGO! Live WebRTC Lovelace Card
  * Directly connects to AWS Kinesis Video Streams WebRTC for ultra-low latency intercom video feed.
- * Version: 1.0.7
+ * Version: 1.0.8
  */
 
 function safeBtoa(obj) {
@@ -34,6 +34,114 @@ function filterPrivateCandidates(sdp) {
     return true;
   });
   return clean.join('\r\n') + '\r\n';
+}
+
+function compactH264Sdp(sdp) {
+  if (!sdp) return '';
+  const lines = sdp.split(/\r?\n/);
+  let inVideo = false;
+  let inApp = false;
+  const h264Pts = new Set();
+  const rtxPts = new Map();
+  let appHasSctpPort = false;
+
+  // Pass 1: identify H.264 payload types and associated RTX
+  for (const line of lines) {
+    if (line.startsWith('m=video ')) {
+      inVideo = true;
+      inApp = false;
+      continue;
+    } else if (line.startsWith('m=application ') || line.startsWith('m=audio ')) {
+      inVideo = false;
+    }
+    if (inVideo) {
+      const rtpmapMatch = line.match(/^a=rtpmap:(\d+)\s+([A-Za-z0-9\-_]+)\//i);
+      if (rtpmapMatch) {
+        const pt = rtpmapMatch[1];
+        const codec = rtpmapMatch[2].toUpperCase();
+        if (codec === 'H264') {
+          h264Pts.add(pt);
+        }
+      }
+      const fmtpMatch = line.match(/^a=fmtp:(\d+)\s+apt=(\d+)/i);
+      if (fmtpMatch) {
+        rtxPts.set(fmtpMatch[1], fmtpMatch[2]);
+      }
+    }
+  }
+
+  const allowedPts = new Set(h264Pts);
+  for (const [rtxPt, aptPt] of rtxPts.entries()) {
+    if (h264Pts.has(aptPt)) {
+      allowedPts.add(rtxPt);
+    }
+  }
+
+  // Pass 2: filter SDP lines
+  inVideo = false;
+  inApp = false;
+  const result = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    if (line.startsWith('m=video ')) {
+      inVideo = true;
+      inApp = false;
+      const parts = line.split(' ');
+      if (parts.length > 3 && allowedPts.size > 0) {
+        const header = parts.slice(0, 3);
+        const pts = parts.slice(3).filter(pt => allowedPts.has(pt));
+        result.push([...header, ...pts].join(' '));
+      } else {
+        result.push(line);
+      }
+      continue;
+    }
+
+    if (line.startsWith('m=application ')) {
+      inVideo = false;
+      inApp = true;
+      result.push(line);
+      continue;
+    }
+
+    if (line.startsWith('m=audio ') || (line.startsWith('m=') && !line.startsWith('m=video ') && !line.startsWith('m=application '))) {
+      inVideo = false;
+      inApp = false;
+      result.push(line);
+      continue;
+    }
+
+    if (inVideo) {
+      const ptAttr = line.match(/^a=(?:rtpmap|fmtp|rtcp-fb):(\d+)/i);
+      if (ptAttr) {
+        const pt = ptAttr[1];
+        if (!allowedPts.has(pt)) {
+          continue;
+        }
+      }
+      result.push(line);
+      continue;
+    }
+
+    if (inApp) {
+      if (line.startsWith('a=sctp-port:')) {
+        appHasSctpPort = true;
+      }
+      result.push(line);
+      continue;
+    }
+
+    result.push(line);
+  }
+
+  let finalSdp = result.join('\r\n');
+  if (!appHasSctpPort && finalSdp.includes('m=application')) {
+    finalSdp = finalSdp.replace(/(m=application[^\r\n]*)/, '$1\r\na=sctp-port:5000');
+  }
+
+  return finalSdp.trim() + '\r\n';
 }
 
 class AcoGoWebRtcCard extends HTMLElement {
@@ -267,7 +375,7 @@ class AcoGoWebRtcCard extends HTMLElement {
               <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
             </svg>
             ${this._config.title}
-            <span class="version-badge">v1.0.7</span>
+            <span class="version-badge">v1.0.8</span>
           </div>
           <div id="statusBadge" class="badge badge-idle">${this._statusText}</div>
         </div>
@@ -417,8 +525,22 @@ class AcoGoWebRtcCard extends HTMLElement {
       iceServers: ice_servers || []
     });
 
-    // CRITICAL: Declare video receiver transceiver to generate m=video line in SDP Offer
-    this._pc.addTransceiver('video', { direction: 'recvonly' });
+    // CRITICAL: Declare video receiver transceiver and force H.264 codec preferences
+    const transceiver = this._pc.addTransceiver('video', { direction: 'recvonly' });
+    if (typeof RTCRtpReceiver !== 'undefined' && typeof RTCRtpReceiver.getCapabilities === 'function') {
+      const cap = RTCRtpReceiver.getCapabilities('video');
+      if (cap && cap.codecs) {
+        const h264Codecs = cap.codecs.filter(c => c.mimeType.toLowerCase() === 'video/h264');
+        if (h264Codecs.length > 0 && typeof transceiver.setCodecPreferences === 'function') {
+          try {
+            transceiver.setCodecPreferences(h264Codecs);
+            console.log('[acoGO WebRTC] Applied setCodecPreferences for H.264 codecs:', h264Codecs.length);
+          } catch (e) {
+            console.warn('[acoGO WebRTC] setCodecPreferences failed:', e);
+          }
+        }
+      }
+    }
 
     // Create DataChannel matching official acoGO Android/iOS app
     const chName = channel_name || `aco_${data.device_id}`;
@@ -512,7 +634,8 @@ class AcoGoWebRtcCard extends HTMLElement {
         const offer = await this._pc.createOffer();
         await this._pc.setLocalDescription(offer);
 
-        const sdpClean = filterPrivateCandidates(this._pc.localDescription.sdp);
+        let sdpClean = compactH264Sdp(this._pc.localDescription.sdp);
+        sdpClean = filterPrivateCandidates(sdpClean);
 
         const msg = {
           action: 'SDP_OFFER',
@@ -543,6 +666,9 @@ class AcoGoWebRtcCard extends HTMLElement {
     };
 
     this._ws.onmessage = async (evt) => {
+      if (!evt.data || !evt.data.trim()) {
+        return;
+      }
       try {
         const msg = JSON.parse(evt.data);
         console.log('[acoGO WebRTC] Received WS message type:', msg.messageType);
@@ -721,4 +847,4 @@ window.customCards.push({
   name: 'acoGO! Live WebRTC Camera',
   description: 'Прямой видеопоток 30 FPS с домофона acoGO через браузерный WebRTC'
 });
-console.info('%c ACOGO-WEBRTC-CARD %c v1.0.7 Loaded ', 'background:#0284c7;color:#fff;font-weight:bold;', 'background:#0d121c;color:#10b981;');
+console.info('%c ACOGO-WEBRTC-CARD %c v1.0.8 Loaded ', 'background:#0284c7;color:#fff;font-weight:bold;', 'background:#0d121c;color:#10b981;');
