@@ -26,7 +26,7 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    """Class to manage fetching ACO GO data from cloud with autonomous two-factor call detection."""
+    """Class to manage fetching ACO GO data from cloud with autonomous call detection."""
 
     def __init__(self, hass: HomeAssistant, api: AcoGoApiClient) -> None:
         super().__init__(
@@ -62,7 +62,7 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._line_monitor_task = None
 
     async def _async_line_monitor_loop(self) -> None:
-        """Autonomous line state monitor with two-factor call detection."""
+        """Autonomous line state monitor for instant doorbell call detection."""
         _LOGGER.debug("Starting autonomous line monitor loop for acoGO")
         try:
             while True:
@@ -92,37 +92,17 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
                     is_busy = (state_resp == "busy" and not is_preview and not is_cooldown)
 
+                    # Physical ring detected on intercom hardware bus
                     if is_busy:
                         if not dev_entry.get("is_ringing"):
-                            # Two-factor verification: probe cloud with preview request to confirm physical ring
-                            is_confirmed = False
-                            try:
-                                probe = await self.api.request_preview(dev_id, preview_type="video-only")
-                                if isinstance(probe, dict) and probe.get("response") == "busy":
-                                    _LOGGER.debug("Two-factor verification confirmed: intercom %s is physically ringing!", dev_id)
-                                    is_confirmed = True
-                                elif isinstance(probe, dict) and probe.get("params"):
-                                    # False alarm: camera line is completely free, teardown probe immediately
-                                    _LOGGER.debug("Two-factor verification: camera is free for %s, discarding false alarm", dev_id)
-                                    await self.api.end_preview()
-                                    is_confirmed = False
-                                    is_busy = False
-                                else:
-                                    # Cloud returned non-standard response or 408; confirm based on hardware check_state
-                                    is_confirmed = True
-                            except Exception as probe_err:
-                                _LOGGER.debug("Probe error: %s (confirming hardware call)", probe_err)
-                                is_confirmed = True
-
-                            if is_confirmed:
-                                self._call_latch_until[dev_id] = now_ts + CALL_LATCH_DURATION
-                                self._call_cooldown_until[dev_id] = now_ts + CALL_COOLDOWN_DURATION
-                                dev_name = dev_entry.get("info", {}).get("name", dev_id)
-                                _LOGGER.info("Doorbell ringing on intercom %s (%s)!", dev_id, dev_name)
-                                self.hass.bus.async_fire("acogo_incoming_call", {
-                                    "device_id": dev_id,
-                                    "name": dev_name,
-                                })
+                            self._call_latch_until[dev_id] = now_ts + CALL_LATCH_DURATION
+                            self._call_cooldown_until[dev_id] = now_ts + CALL_COOLDOWN_DURATION
+                            dev_name = dev_entry.get("info", {}).get("name", dev_id)
+                            _LOGGER.info("Doorbell ringing on intercom %s (%s)!", dev_id, dev_name)
+                            self.hass.bus.async_fire("acogo_incoming_call", {
+                                "device_id": dev_id,
+                                "name": dev_name,
+                            })
 
                     is_ringing = (now_ts < self._call_latch_until.get(dev_id, 0))
                     is_online = (state_resp != "offline")
