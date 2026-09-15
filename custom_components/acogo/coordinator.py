@@ -37,6 +37,7 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.preview_active_devices: dict[str, dict[str, Any]] = {}
         self._preview_watchdog_handles: dict[str, asyncio.TimerHandle] = {}
         self._call_latch_until: dict[str, float] = {}
+        self._bus_failure_start: dict[str, float] = {}
         self._line_monitor_task: asyncio.Task | None = None
         # Cache for last valid real camera frame (device_id -> (timestamp, jpeg_bytes))
         self.last_valid_snapshot: dict[str, tuple[float, bytes]] = {}
@@ -78,30 +79,62 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         state_resp = await self.api.check_state(dev_id)
                     except Exception as err:
                         _LOGGER.debug("Line monitor error checking state for %s: %s", dev_id, err)
-                        continue
+                        state_resp = "bus_busy"
 
                     is_preview = self.is_preview_active(dev_id)
-                    is_busy = (state_resp == "busy" and not is_preview)
 
+                    # Double-check debounce: verify bus busy state consecutively
+                    # to distinguish a real physical call from a transient network jitter
+                    if state_resp in ("busy", "bus_busy") and not is_preview:
+                        await asyncio.sleep(0.4)
+                        try:
+                            confirm_resp = await self.api.check_state(dev_id)
+                        except Exception:
+                            confirm_resp = "bus_busy"
+
+                        if confirm_resp in ("busy", "bus_busy"):
+                            is_busy = True
+                        else:
+                            is_busy = False
+                            state_resp = confirm_resp
+                    else:
+                        is_busy = False
+
+                    # Offline watchdog & ringing latch
                     if is_busy:
-                        # Call active: latch for at least CALL_LATCH_DURATION (20s)
-                        self._call_latch_until[dev_id] = now_ts + CALL_LATCH_DURATION
-                        if not dev_entry.get("is_ringing"):
-                            dev_name = dev_entry.get("info", {}).get("name", dev_id)
-                            _LOGGER.info("Doorbell ringing on intercom %s (%s)!", dev_id, dev_name)
-                            self.hass.bus.async_fire("acogo_incoming_call", {
-                                "device_id": dev_id,
-                                "name": dev_name,
-                            })
+                        if dev_id not in self._bus_failure_start:
+                            self._bus_failure_start[dev_id] = now_ts
+                        fail_duration = now_ts - self._bus_failure_start[dev_id]
 
-                    is_ringing = (now_ts < self._call_latch_until.get(dev_id, 0)) or is_busy
+                        # If bus has been unreachable for > 45 seconds continuously, it is OFFLINE, not ringing
+                        if fail_duration > 45.0:
+                            is_busy = False
+                            is_ringing = False
+                            is_online = False
+                            state_resp = "offline"
+                        else:
+                            is_online = True
+                            # Call confirmed: latch for at least CALL_LATCH_DURATION (25s)
+                            if not dev_entry.get("is_ringing") and fail_duration <= CALL_LATCH_DURATION:
+                                self._call_latch_until[dev_id] = now_ts + CALL_LATCH_DURATION
+                                dev_name = dev_entry.get("info", {}).get("name", dev_id)
+                                _LOGGER.info("Doorbell ringing on intercom %s (%s)!", dev_id, dev_name)
+                                self.hass.bus.async_fire("acogo_incoming_call", {
+                                    "device_id": dev_id,
+                                    "name": dev_name,
+                                })
+                            is_ringing = (now_ts < self._call_latch_until.get(dev_id, 0))
+                    else:
+                        self._bus_failure_start.pop(dev_id, None)
+                        is_online = (state_resp != "offline")
+                        is_ringing = (now_ts < self._call_latch_until.get(dev_id, 0))
 
                     prev_ringing = dev_entry.get("is_ringing", False)
                     prev_state = dev_entry.get("state")
 
-                    if is_ringing != prev_ringing or state_resp != prev_state:
+                    if is_ringing != prev_ringing or state_resp != prev_state or is_online != dev_entry.get("is_online"):
                         dev_entry["state"] = state_resp
-                        dev_entry["is_online"] = (state_resp != "offline")
+                        dev_entry["is_online"] = is_online
                         dev_entry["is_ringing"] = is_ringing
                         state_changed = True
 
@@ -198,22 +231,13 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     prev_state = self.data.get(dev_id, {}).get("state", "ready") if self.data else "ready"
                     state_resp = prev_state
 
-                is_busy = (state_resp == "busy" and not self.is_preview_active(dev_id) and not self.api.is_device_busy(dev_id))
-                if is_busy:
-                    self._call_latch_until[dev_id] = now_ts + CALL_LATCH_DURATION
-                    if not self.data or not self.data.get(dev_id, {}).get("is_ringing"):
-                        dev_name = dev.get("name", dev_id)
-                        _LOGGER.info("Doorbell ringing on intercom %s (%s)!", dev_id, dev_name)
-                        self.hass.bus.async_fire("acogo_incoming_call", {
-                            "device_id": dev_id,
-                            "name": dev_name,
-                        })
-
-                is_ringing = (now_ts < self._call_latch_until.get(dev_id, 0)) or is_busy
+                is_busy = (state_resp in ("busy", "bus_busy") and not self.is_preview_active(dev_id) and not self.api.is_device_busy(dev_id))
+                is_latched = (now_ts < self._call_latch_until.get(dev_id, 0))
+                is_ringing = is_latched or is_busy
 
                 devices_data[dev_id] = {
                     "info": dev,
-                    "state": state_resp,  # 'ready', 'busy', 'offline'
+                    "state": state_resp,  # 'ready', 'busy', 'offline', 'bus_busy'
                     "is_online": (state_resp != "offline"),
                     "is_ringing": is_ringing,
                 }
