@@ -144,27 +144,21 @@ class AcoGoApiClient:
         path: str,
         json: Any = None,
         custom_timeout: aiohttp.ClientTimeout | None = None,
+        retry_on_401: bool = True,
     ) -> Any:
+        """Send authenticated request to ACO GO API with automatic 401 recovery."""
         url = f"{BASE_URL}{path}"
-        req_timeout = custom_timeout or API_TIMEOUT
+        headers = self._get_headers()
+        timeout = custom_timeout or API_TIMEOUT
+
         try:
-            async with self.session.request(method, url, json=json, headers=self._get_headers(), timeout=req_timeout) as resp:
-                if resp.status == 401:
-                    if path == "/order/video-sw":
-                        text = await resp.text()
-                        raise AcoGoApiError(
-                            f"Camera switching (video-sw) is not supported or authorized by cloud for device "
-                            f"(PRO model and PRO-VIDEO-SW2-60 required): {text}"
-                        )
-
-                    if self.username and self.password:
-                        _LOGGER.info("ACO GO token expired (401). Handling re-authentication...")
-                        current_pwd = self.device_password
-                        async with self._auth_lock:
-                            if self.device_password == current_pwd:
-                                await self.register_device()
-
-                        async with self.session.request(method, url, json=json, headers=self._get_headers(), timeout=req_timeout) as retry_resp:
+            async with self.session.request(method, url, json=json, headers=headers, timeout=timeout) as resp:
+                if resp.status == 401 and retry_on_401 and self.username and self.password:
+                    async with self._auth_lock:
+                        _LOGGER.info("Session expired (401), re-authenticating device...")
+                        await self.register_device()
+                        headers = self._get_headers()
+                        async with self.session.request(method, url, json=json, headers=headers, timeout=timeout) as retry_resp:
                             if retry_resp.status not in (200, 201, 202):
                                 text = await retry_resp.text()
                                 raise AcoGoApiError(f"Request failed after re-auth: {retry_resp.status} on {path}: {text}")
@@ -195,9 +189,12 @@ class AcoGoApiClient:
                     return val
             return "ready"
         except (asyncio.TimeoutError, TimeoutError):
-            _LOGGER.debug("check-state timed out (>%ss) for %s", CHECK_STATE_TIMEOUT, device_id)
-            return "ready"
+            _LOGGER.debug("check-state timed out (>%ss) for %s (intercom hardware bus occupied)", CHECK_STATE_TIMEOUT, device_id)
+            return "busy"
         except AcoGoApiError as err:
+            if "408" in str(err):
+                _LOGGER.debug("check-state 408 Request Timeout for %s (intercom hardware bus occupied)", device_id)
+                return "busy"
             _LOGGER.debug("check-state API error for %s: %s", device_id, err)
             return "ready"
         except Exception as err:

@@ -14,6 +14,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .api import AcoGoApiClient, AcoGoApiError
 from .const import (
     APP_MODELS,
+    CALL_COOLDOWN_DURATION,
     CALL_LATCH_DURATION,
     DOMAIN,
     FAST_POLL_INTERVAL,
@@ -25,7 +26,7 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    """Class to manage fetching ACO GO data from cloud with fast line monitoring."""
+    """Class to manage fetching ACO GO data from cloud with autonomous two-factor call detection."""
 
     def __init__(self, hass: HomeAssistant, api: AcoGoApiClient) -> None:
         super().__init__(
@@ -38,14 +39,14 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.preview_active_devices: dict[str, dict[str, Any]] = {}
         self._preview_watchdog_handles: dict[str, asyncio.TimerHandle] = {}
         self._call_latch_until: dict[str, float] = {}
+        self._call_cooldown_until: dict[str, float] = {}
         self._preview_cooldown_until: dict[str, float] = {}
-        self._bus_failure_start: dict[str, float] = {}
         self._line_monitor_task: asyncio.Task | None = None
         # Cache for last valid real camera frame (device_id -> (timestamp, jpeg_bytes))
         self.last_valid_snapshot: dict[str, tuple[float, bytes]] = {}
 
     def start_line_monitor(self) -> None:
-        """Start the high-frequency line state monitor task if not already running."""
+        """Start the autonomous line state monitor task if not already running."""
         if self._line_monitor_task is None or self._line_monitor_task.done():
             if hasattr(self.hass, "async_create_background_task"):
                 self._line_monitor_task = self.hass.async_create_background_task(
@@ -61,8 +62,8 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._line_monitor_task = None
 
     async def _async_line_monitor_loop(self) -> None:
-        """High-frequency line state monitor for instant doorbell call detection."""
-        _LOGGER.debug("Starting high-frequency line monitor loop for acoGO")
+        """Autonomous line state monitor with two-factor call detection."""
+        _LOGGER.debug("Starting autonomous line monitor loop for acoGO")
         try:
             while True:
                 await asyncio.sleep(FAST_POLL_INTERVAL)
@@ -84,40 +85,47 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         state_resp = "ready"
 
                     is_preview = self.is_preview_active(dev_id)
-                    is_cooldown = (now_ts < self._preview_cooldown_until.get(dev_id, 0))
+                    is_cooldown = (
+                        (now_ts < self._preview_cooldown_until.get(dev_id, 0))
+                        or (now_ts < self._call_cooldown_until.get(dev_id, 0))
+                    )
 
-                    # Line is considered in active call when cloud explicitly signals busy
-                    # and neither preview session nor post-preview cooldown is active
                     is_busy = (state_resp == "busy" and not is_preview and not is_cooldown)
 
-                    # Offline watchdog & ringing latch
                     if is_busy:
-                        if dev_id not in self._bus_failure_start:
-                            self._bus_failure_start[dev_id] = now_ts
-                        fail_duration = now_ts - self._bus_failure_start[dev_id]
+                        if not dev_entry.get("is_ringing"):
+                            # Two-factor verification: probe cloud with preview request to confirm physical ring
+                            is_confirmed = False
+                            try:
+                                probe = await self.api.request_preview(dev_id, preview_type="video-only")
+                                if isinstance(probe, dict) and probe.get("response") == "busy":
+                                    _LOGGER.debug("Two-factor verification confirmed: intercom %s is physically ringing!", dev_id)
+                                    is_confirmed = True
+                                elif isinstance(probe, dict) and probe.get("params"):
+                                    # False alarm: camera line is completely free, teardown probe immediately
+                                    _LOGGER.debug("Two-factor verification: camera is free for %s, discarding false alarm", dev_id)
+                                    await self.api.end_preview()
+                                    is_confirmed = False
+                                    is_busy = False
+                                else:
+                                    # Cloud returned non-standard response or 408; confirm based on hardware check_state
+                                    is_confirmed = True
+                            except Exception as probe_err:
+                                _LOGGER.debug("Probe error: %s (confirming hardware call)", probe_err)
+                                is_confirmed = True
 
-                        # If bus has been unreachable for > 45 seconds continuously, it is OFFLINE, not ringing
-                        if fail_duration > 45.0:
-                            is_busy = False
-                            is_ringing = False
-                            is_online = False
-                            state_resp = "offline"
-                        else:
-                            is_online = True
-                            # Call confirmed: latch for at least CALL_LATCH_DURATION (25s)
-                            if not dev_entry.get("is_ringing") and fail_duration <= CALL_LATCH_DURATION:
+                            if is_confirmed:
                                 self._call_latch_until[dev_id] = now_ts + CALL_LATCH_DURATION
+                                self._call_cooldown_until[dev_id] = now_ts + CALL_COOLDOWN_DURATION
                                 dev_name = dev_entry.get("info", {}).get("name", dev_id)
                                 _LOGGER.info("Doorbell ringing on intercom %s (%s)!", dev_id, dev_name)
                                 self.hass.bus.async_fire("acogo_incoming_call", {
                                     "device_id": dev_id,
                                     "name": dev_name,
                                 })
-                            is_ringing = (now_ts < self._call_latch_until.get(dev_id, 0))
-                    else:
-                        self._bus_failure_start.pop(dev_id, None)
-                        is_online = (state_resp != "offline")
-                        is_ringing = (now_ts < self._call_latch_until.get(dev_id, 0))
+
+                    is_ringing = (now_ts < self._call_latch_until.get(dev_id, 0))
+                    is_online = (state_resp != "offline")
 
                     prev_ringing = dev_entry.get("is_ringing", False)
                     prev_state = dev_entry.get("state")
@@ -226,7 +234,10 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     state_resp = prev_state
 
                 is_preview = self.is_preview_active(dev_id)
-                is_cooldown = (now_ts < self._preview_cooldown_until.get(dev_id, 0))
+                is_cooldown = (
+                    (now_ts < self._preview_cooldown_until.get(dev_id, 0))
+                    or (now_ts < self._call_cooldown_until.get(dev_id, 0))
+                )
                 is_busy = (state_resp == "busy" and not is_preview and not self.api.is_device_busy(dev_id) and not is_cooldown)
                 is_latched = (now_ts < self._call_latch_until.get(dev_id, 0))
                 is_ringing = is_latched or is_busy

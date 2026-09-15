@@ -1,7 +1,7 @@
 """Constants for the acoGO integration."""
 
 DOMAIN = "acogo"
-VERSION = "1.1.4"
+VERSION = "1.1.5"
 
 BASE_URL = "https://api.aco.com.pl/listener/v1"
 
@@ -28,8 +28,9 @@ PREVIEW_COOLDOWN_DELAY = 12.0
 
 # Line monitoring timers
 FAST_POLL_INTERVAL = 2.5
-CHECK_STATE_TIMEOUT = 4.5
-CALL_LATCH_DURATION = 25.0
+CHECK_STATE_TIMEOUT = 3.5
+CALL_LATCH_DURATION = 10.0
+CALL_COOLDOWN_DURATION = 25.0
 
 # Models
 APP_MODELS = {62, 63}

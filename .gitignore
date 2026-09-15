@@ -40,3 +40,4 @@ Thumbs.db
 # Logs and scratch scripts
 acogo.log
 scratch/
+*.log
