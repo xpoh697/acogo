@@ -65,7 +65,14 @@ class AcoGoApiClient:
         return lock is not None and lock.locked()
 
     async def _parse_response(self, resp: aiohttp.ClientResponse) -> Any:
-        """Robustly parse response without failing on text/plain, empty bodies, or non-JSON."""
+        """Robustly parse response without failing on text/plain, empty bodies, or non-JSON.
+        
+        HTTP 202 Accepted with empty body is sent by ACO Cloud when the intercom line is busy
+        processing an active call event.
+        """
+        if resp.status == 202:
+            return {"response": "busy", "status": 202}
+
         text = await resp.text()
         if not text or not text.strip():
             return {}
@@ -185,15 +192,8 @@ class AcoGoApiClient:
         return []
 
     async def check_state(self, device_id: str) -> str:
-        """Check status of intercom line ('ready', 'busy', 'offline', 'bus_busy').
-        
-        During physical doorbell calls the ACO gateway takes over the serial bus to ring
-        indoor handsets and negotiate the audio/video call channel. The cloud gateway
-        cannot query the hardware over the 2-wire bus and returns HTTP 500, 408 or times out.
-        Returns 'bus_busy' when the bus is occupied/unreachable, enabling double-check
-        debounce in coordinator.py for robust call detection.
-        """
-        fast_timeout = aiohttp.ClientTimeout(total=CHECK_STATE_TIMEOUT, connect=2.0)
+        """Check status of intercom line ('ready', 'busy', 'offline')."""
+        fast_timeout = aiohttp.ClientTimeout(total=CHECK_STATE_TIMEOUT, connect=1.0)
         try:
             res = await self._request("POST", "/device/check-state", json={"devId": device_id}, custom_timeout=fast_timeout)
             if isinstance(res, dict):
@@ -202,14 +202,14 @@ class AcoGoApiClient:
                     return val
             return "ready"
         except (asyncio.TimeoutError, TimeoutError):
-            _LOGGER.debug("check-state timed out (>%ss) for %s (bus occupied/ringing)", CHECK_STATE_TIMEOUT, device_id)
-            return "bus_busy"
+            _LOGGER.debug("check-state timed out (>%ss) for %s", CHECK_STATE_TIMEOUT, device_id)
+            return "ready"
         except AcoGoApiError as err:
-            _LOGGER.debug("check-state API error for %s: %s (bus occupied/ringing)", device_id, err)
-            return "bus_busy"
+            _LOGGER.debug("check-state API error for %s: %s", device_id, err)
+            return "ready"
         except Exception as err:
             _LOGGER.debug("check-state connection error for %s: %r", device_id, err)
-            return "bus_busy"
+            return "ready"
 
     async def send_order(self, target_id: str, order_id: str) -> bool:
         """Send command to intercom."""
@@ -227,7 +227,7 @@ class AcoGoApiClient:
 
         async with lock:
             state = await self.check_state(target_id)
-            is_active_call = (state in ("busy", "bus_busy"))
+            is_active_call = (state == "busy")
 
             if is_active_call:
                 return await self.send_order(target_id, order_cmd)

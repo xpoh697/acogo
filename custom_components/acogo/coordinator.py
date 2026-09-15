@@ -17,6 +17,7 @@ from .const import (
     CALL_LATCH_DURATION,
     DOMAIN,
     FAST_POLL_INTERVAL,
+    PREVIEW_COOLDOWN_DELAY,
     PREVIEW_WATCHDOG_TIMEOUT,
 )
 
@@ -37,6 +38,7 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.preview_active_devices: dict[str, dict[str, Any]] = {}
         self._preview_watchdog_handles: dict[str, asyncio.TimerHandle] = {}
         self._call_latch_until: dict[str, float] = {}
+        self._preview_cooldown_until: dict[str, float] = {}
         self._bus_failure_start: dict[str, float] = {}
         self._line_monitor_task: asyncio.Task | None = None
         # Cache for last valid real camera frame (device_id -> (timestamp, jpeg_bytes))
@@ -79,26 +81,14 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         state_resp = await self.api.check_state(dev_id)
                     except Exception as err:
                         _LOGGER.debug("Line monitor error checking state for %s: %s", dev_id, err)
-                        state_resp = "bus_busy"
+                        state_resp = "ready"
 
                     is_preview = self.is_preview_active(dev_id)
+                    is_cooldown = (now_ts < self._preview_cooldown_until.get(dev_id, 0))
 
-                    # Double-check debounce: verify bus busy state consecutively
-                    # to distinguish a real physical call from a transient network jitter
-                    if state_resp in ("busy", "bus_busy") and not is_preview:
-                        await asyncio.sleep(0.4)
-                        try:
-                            confirm_resp = await self.api.check_state(dev_id)
-                        except Exception:
-                            confirm_resp = "bus_busy"
-
-                        if confirm_resp in ("busy", "bus_busy"):
-                            is_busy = True
-                        else:
-                            is_busy = False
-                            state_resp = confirm_resp
-                    else:
-                        is_busy = False
+                    # Line is considered in active call when cloud signals busy
+                    # and neither preview session nor post-preview cooldown is active
+                    is_busy = (state_resp == "busy" and not is_preview and not is_cooldown)
 
                     # Offline watchdog & ringing latch
                     if is_busy:
@@ -194,10 +184,14 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return params
 
     async def async_stop_preview(self, dev_id: str) -> None:
-        """End live preview session and release intercom line."""
+        """End live preview session and release intercom line with cooldown protection."""
         if dev_id in self._preview_watchdog_handles:
             self._preview_watchdog_handles[dev_id].cancel()
             self._preview_watchdog_handles.pop(dev_id, None)
+
+        # Set cooldown so monitor does not misinterpret preview teardown as incoming call
+        now_ts = asyncio.get_running_loop().time()
+        self._preview_cooldown_until[dev_id] = now_ts + PREVIEW_COOLDOWN_DELAY
 
         try:
             await self.api.end_preview()
@@ -231,13 +225,15 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     prev_state = self.data.get(dev_id, {}).get("state", "ready") if self.data else "ready"
                     state_resp = prev_state
 
-                is_busy = (state_resp in ("busy", "bus_busy") and not self.is_preview_active(dev_id) and not self.api.is_device_busy(dev_id))
+                is_preview = self.is_preview_active(dev_id)
+                is_cooldown = (now_ts < self._preview_cooldown_until.get(dev_id, 0))
+                is_busy = (state_resp == "busy" and not is_preview and not self.api.is_device_busy(dev_id) and not is_cooldown)
                 is_latched = (now_ts < self._call_latch_until.get(dev_id, 0))
                 is_ringing = is_latched or is_busy
 
                 devices_data[dev_id] = {
                     "info": dev,
-                    "state": state_resp,  # 'ready', 'busy', 'offline', 'bus_busy'
+                    "state": state_resp,  # 'ready', 'busy', 'offline'
                     "is_online": (state_resp != "offline"),
                     "is_ringing": is_ringing,
                 }

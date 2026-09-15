@@ -27,6 +27,7 @@ from .const import (
     ORDER_REJECT_CALL,
 )
 from .coordinator import AcoGoDataUpdateCoordinator
+from .webrtc import setup_acogo_file_logger
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -39,6 +40,9 @@ PLATFORMS: list[Platform] = [
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up acoGO from a config entry."""
+    # Ensure dedicated file logger writing to /config/acogo.log is active
+    setup_acogo_file_logger()
+
     hass.data.setdefault(DOMAIN, {})
 
     dev_id: str = entry.data[CONF_DEV_ID]
