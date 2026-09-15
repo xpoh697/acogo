@@ -1,12 +1,14 @@
 {
   "domain": "acogo",
   "name": "acoGO! Intercom",
-  "codeowners": ["@aco-ha"],
+  "codeowners": [
+    "@aco-ha"
+  ],
   "config_flow": true,
   "documentation": "https://github.com/aco-ha/acogo",
   "integration_type": "hub",
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/aco-ha/acogo/issues",
   "requirements": [],
-  "version": "1.1.5"
+  "version": "1.1.6"
 }

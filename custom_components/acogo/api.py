@@ -189,12 +189,9 @@ class AcoGoApiClient:
                     return val
             return "ready"
         except (asyncio.TimeoutError, TimeoutError):
-            _LOGGER.debug("check-state timed out (>%ss) for %s (intercom hardware bus occupied)", CHECK_STATE_TIMEOUT, device_id)
-            return "busy"
+            _LOGGER.debug("check-state timed out (>%ss) for %s (wireless jitter, returning ready)", CHECK_STATE_TIMEOUT, device_id)
+            return "ready"
         except AcoGoApiError as err:
-            if "408" in str(err):
-                _LOGGER.debug("check-state 408 Request Timeout for %s (intercom hardware bus occupied)", device_id)
-                return "busy"
             _LOGGER.debug("check-state API error for %s: %s", device_id, err)
             return "ready"
         except Exception as err:

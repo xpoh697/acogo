@@ -46,14 +46,8 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.last_valid_snapshot: dict[str, tuple[float, bytes]] = {}
 
     def start_line_monitor(self) -> None:
-        """Start the autonomous line state monitor task if not already running."""
-        if self._line_monitor_task is None or self._line_monitor_task.done():
-            if hasattr(self.hass, "async_create_background_task"):
-                self._line_monitor_task = self.hass.async_create_background_task(
-                    self._async_line_monitor_loop(), "acogo_line_monitor"
-                )
-            else:
-                self._line_monitor_task = self.hass.loop.create_task(self._async_line_monitor_loop())
+        """Line monitor disabled to eliminate cloud spam and wireless jitter phantoms."""
+        return
 
     def stop_line_monitor(self) -> None:
         """Stop line state monitor task."""
