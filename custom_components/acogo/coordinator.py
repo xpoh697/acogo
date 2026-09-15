@@ -86,7 +86,7 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     is_preview = self.is_preview_active(dev_id)
                     is_cooldown = (now_ts < self._preview_cooldown_until.get(dev_id, 0))
 
-                    # Line is considered in active call when cloud signals busy
+                    # Line is considered in active call when cloud explicitly signals busy
                     # and neither preview session nor post-preview cooldown is active
                     is_busy = (state_resp == "busy" and not is_preview and not is_cooldown)
 

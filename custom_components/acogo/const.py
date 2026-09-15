@@ -1,7 +1,7 @@
 """Constants for the acoGO integration."""
 
 DOMAIN = "acogo"
-VERSION = "1.1.3"
+VERSION = "1.1.4"
 
 BASE_URL = "https://api.aco.com.pl/listener/v1"
 
@@ -24,11 +24,11 @@ DOOR_HOLD_DELAY = 5.0
 PREVIEW_AUTO_CLOSE_TIMEOUT = 30.0
 PREVIEW_WATCHDOG_TIMEOUT = 45.0
 PREVIEW_CAPTURE_TIMEOUT = 25.0
-PREVIEW_COOLDOWN_DELAY = 8.0
+PREVIEW_COOLDOWN_DELAY = 12.0
 
-# Line monitoring timers (optimized from live telemetry)
-FAST_POLL_INTERVAL = 1.5
-CHECK_STATE_TIMEOUT = 2.0
+# Line monitoring timers
+FAST_POLL_INTERVAL = 2.5
+CHECK_STATE_TIMEOUT = 4.5
 CALL_LATCH_DURATION = 25.0
 
 # Models

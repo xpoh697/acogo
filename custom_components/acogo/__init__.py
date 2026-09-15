@@ -40,7 +40,6 @@ PLATFORMS: list[Platform] = [
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up acoGO from a config entry."""
-    # Ensure dedicated file logger writing to /config/acogo.log is active
     setup_acogo_file_logger()
 
     hass.data.setdefault(DOMAIN, {})

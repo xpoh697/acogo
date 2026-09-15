@@ -65,14 +65,7 @@ class AcoGoApiClient:
         return lock is not None and lock.locked()
 
     async def _parse_response(self, resp: aiohttp.ClientResponse) -> Any:
-        """Robustly parse response without failing on text/plain, empty bodies, or non-JSON.
-        
-        HTTP 202 Accepted with empty body is sent by ACO Cloud when the intercom line is busy
-        processing an active call event.
-        """
-        if resp.status == 202:
-            return {"response": "busy", "status": 202}
-
+        """Robustly parse response without failing on text/plain, empty bodies, or non-JSON."""
         text = await resp.text()
         if not text or not text.strip():
             return {}
@@ -193,7 +186,7 @@ class AcoGoApiClient:
 
     async def check_state(self, device_id: str) -> str:
         """Check status of intercom line ('ready', 'busy', 'offline')."""
-        fast_timeout = aiohttp.ClientTimeout(total=CHECK_STATE_TIMEOUT, connect=1.0)
+        fast_timeout = aiohttp.ClientTimeout(total=CHECK_STATE_TIMEOUT, connect=2.0)
         try:
             res = await self._request("POST", "/device/check-state", json={"devId": device_id}, custom_timeout=fast_timeout)
             if isinstance(res, dict):
