@@ -53,14 +53,14 @@ def setup_acogo_file_logger() -> None:
         handler.setLevel(logging.DEBUG)
 
         target_loggers = [
-            "custom_components.acogo",
-            "aiortc",
-            "aioice",
+            ("custom_components.acogo", logging.DEBUG),
+            ("aiortc", logging.WARNING),
+            ("aioice", logging.WARNING),
         ]
 
-        for name in target_loggers:
+        for name, level in target_loggers:
             lg = logging.getLogger(name)
-            lg.setLevel(logging.DEBUG)
+            lg.setLevel(level)
             for h in list(lg.handlers):
                 if isinstance(h, RotatingFileHandler) and getattr(h, "baseFilename", "") == handler.baseFilename:
                     lg.removeHandler(h)
