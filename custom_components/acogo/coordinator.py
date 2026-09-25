@@ -216,11 +216,12 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 is_latched = (now_ts < self._call_latch_until.get(dev_id, 0))
                 is_ringing = is_latched or is_busy
 
+                is_offline = (dev.get("status") == "offline" or state_resp == "offline")
                 devices_data[dev_id] = {
                     "info": dev,
-                    "state": state_resp,  # 'ready', 'busy', 'offline'
-                    "is_online": (state_resp != "offline"),
-                    "is_ringing": is_ringing,
+                    "state": "offline" if is_offline else state_resp,  # 'ready', 'busy', 'offline'
+                    "is_online": not is_offline,
+                    "is_ringing": False if is_offline else is_ringing,
                 }
 
             return devices_data
