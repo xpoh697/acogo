@@ -11,7 +11,7 @@ import uuid
 
 from aiohttp import web
 
-from homeassistant.components import frontend
+from homeassistant.components import frontend, webhook
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
@@ -35,7 +35,9 @@ from .const import (
     ORDER_F2_OPEN,
     ORDER_RECEIVE_CALL,
     ORDER_REJECT_CALL,
+    SERVICE_TRIGGER_INCOMING_CALL,
     VERSION,
+    WEBHOOK_ID,
 )
 from .coordinator import AcoGoDataUpdateCoordinator
 from .webrtc import fetch_ice_servers, generate_signed_wss_url, setup_acogo_file_logger
@@ -230,6 +232,53 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.services.async_register(DOMAIN, "switch_camera", async_handle_switch_camera)
 
+    # Register custom service: trigger_incoming_call
+    async def async_handle_trigger_call(call: ServiceCall) -> None:
+        device_id = call.data.get("device_id")
+        await coordinator.async_handle_call_trigger(device_id=device_id, source="service")
+
+    hass.services.async_register(DOMAIN, SERVICE_TRIGGER_INCOMING_CALL, async_handle_trigger_call)
+
+    # Register native webhook for wall tablet
+    async def async_handle_webhook(hass: HomeAssistant, webhook_id: str, request: web.Request) -> web.Response:
+        device_id = None
+        action = "ring"
+        try:
+            if request.can_read_body:
+                text = await request.text()
+                if text and text.strip():
+                    try:
+                        import json as json_lib
+                        body = json_lib.loads(text)
+                        if isinstance(body, dict):
+                            device_id = body.get("device_id")
+                            action = body.get("action", "ring")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        if action == "cancel" and device_id:
+            coordinator.reset_call_state(device_id)
+            return web.json_response({"status": "cancelled"})
+
+        success = await coordinator.async_handle_call_trigger(device_id=device_id, source="webhook")
+        return web.json_response({"status": "ok" if success else "ignored"})
+
+    try:
+        webhook.async_register(
+            hass,
+            DOMAIN,
+            "acoGO Incoming Call",
+            WEBHOOK_ID,
+            async_handle_webhook,
+            local_only=True,
+        )
+        _LOGGER.debug("Registered acoGO call webhook: %s", WEBHOOK_ID)
+    except ValueError:
+        pass
+
+
     # Register custom service: start_webrtc_stream
     async def async_handle_start_stream(call: ServiceCall) -> dict[str, Any]:
         device_id = call.data.get("device_id") or next(iter(coordinator.data), None)
@@ -393,5 +442,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.services.async_remove(DOMAIN, "capture_snapshot")
             hass.services.async_remove(DOMAIN, "send_order")
             hass.services.async_remove(DOMAIN, "switch_camera")
+            try:
+                webhook.async_unregister(hass, WEBHOOK_ID)
+            except Exception:
+                pass
+            hass.services.async_remove(DOMAIN, SERVICE_TRIGGER_INCOMING_CALL)
 
     return unload_ok

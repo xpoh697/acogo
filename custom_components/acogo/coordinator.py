@@ -17,6 +17,7 @@ from .const import (
     CALL_COOLDOWN_DURATION,
     CALL_LATCH_DURATION,
     DOMAIN,
+    EVENT_INCOMING_CALL,
     FAST_POLL_INTERVAL,
     PREVIEW_COOLDOWN_DELAY,
     PREVIEW_WATCHDOG_TIMEOUT,
@@ -190,6 +191,62 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def get_preview_params(self, dev_id: str) -> dict[str, Any]:
         """Get current preview parameters for device."""
         return self.preview_active_devices.get(dev_id, {})
+
+    async def async_handle_call_trigger(self, device_id: str | None = None, source: str = "webhook") -> bool:
+        """Handle incoming call trigger from webhook or automation with cooldown and auto-reset."""
+        now_ts = asyncio.get_running_loop().time()
+        target_dev_id = device_id
+        if not target_dev_id and self.data:
+            for dev_id, dev_data in self.data.items():
+                model = dev_data.get("info", {}).get("model")
+                if model not in APP_MODELS:
+                    target_dev_id = dev_id
+                    break
+
+        if not target_dev_id or not self.data or target_dev_id not in self.data:
+            _LOGGER.warning("Call trigger received but no intercom device found in coordinator data")
+            return False
+
+        # 10s cooldown to prevent notification chattering / duplicate push packets
+        last_cooldown = self._call_cooldown_until.get(target_dev_id, 0)
+        if now_ts < last_cooldown:
+            _LOGGER.debug("Call trigger for %s ignored due to active cooldown", target_dev_id)
+            return False
+
+        ring_duration = 35.0
+        self._call_latch_until[target_dev_id] = now_ts + ring_duration
+        self._call_cooldown_until[target_dev_id] = now_ts + 10.0
+
+        dev_name = self.data[target_dev_id].get("info", {}).get("name", target_dev_id)
+        _LOGGER.info("Doorbell incoming call triggered via %s for %s (%s)!", source, target_dev_id, dev_name)
+
+        self.data[target_dev_id]["is_ringing"] = True
+        self.async_update_listeners()
+
+        self.hass.bus.async_fire(EVENT_INCOMING_CALL, {
+            "device_id": target_dev_id,
+            "name": dev_name,
+            "source": source,
+        })
+
+        # Automatic watchdog reset after ring_duration
+        def _reset_call() -> None:
+            if target_dev_id in self.data and self.data[target_dev_id].get("is_ringing"):
+                if asyncio.get_running_loop().time() >= self._call_latch_until.get(target_dev_id, 0):
+                    self.data[target_dev_id]["is_ringing"] = False
+                    self.async_update_listeners()
+                    _LOGGER.debug("Call latch expired for %s", target_dev_id)
+
+        self.hass.loop.call_later(ring_duration, _reset_call)
+        return True
+
+    def reset_call_state(self, device_id: str) -> None:
+        """Immediately reset ringing state (e.g. after door opened or call answered/ended)."""
+        self._call_latch_until[device_id] = 0.0
+        if self.data and device_id in self.data and self.data[device_id].get("is_ringing"):
+            self.data[device_id]["is_ringing"] = False
+            self.async_update_listeners()
+            _LOGGER.debug("Call state reset for %s", device_id)
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from ACO GO Cloud with graceful degradation on transient glitches."""

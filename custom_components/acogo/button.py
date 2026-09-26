@@ -75,6 +75,7 @@ class AcoGoOpenButton(CoordinatorEntity[AcoGoDataUpdateCoordinator], ButtonEntit
     async def async_press(self) -> None:
         """Trigger opening sequence."""
         try:
+            self.coordinator.reset_call_state(self.dev_id)
             await self.coordinator.api.open_door_sequence(self.dev_id, is_gate=self.is_gate)
         except AcoGoApiError as err:
             action = "ворот" if self.is_gate else "двери"

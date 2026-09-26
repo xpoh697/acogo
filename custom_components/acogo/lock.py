@@ -67,6 +67,7 @@ class AcoGoLock(CoordinatorEntity[AcoGoDataUpdateCoordinator], LockEntity):
         self.async_write_ha_state()
 
         try:
+            self.coordinator.reset_call_state(self.dev_id)
             await self.coordinator.api.open_door_sequence(self.dev_id, is_gate=self.is_gate)
         finally:
             self._attr_is_locked = True
