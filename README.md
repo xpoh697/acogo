@@ -1,12 +1,16 @@
-# acoGO! 2.0 — Home Assistant Integration
-
-[![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg?style=for-the-badge)](https://github.com/hacs/integration)
-[![GitHub Release](https://img.shields.io/github/v/release/xpoh697/acogo?style=for-the-badge)](https://github.com/xpoh697/acogo/releases)
-[![License](https://img.shields.io/github/license/xpoh697/acogo?style=for-the-badge)](LICENSE)
-
 <p align="center">
   <img src="icon.png" width="180" height="180" alt="acoGO! Home Assistant Integration">
 </p>
+
+<h1 align="center">acoGO! 2.0 — Home Assistant Integration</h1>
+
+<p align="center">
+  <a href="https://github.com/hacs/default"><img src="https://img.shields.io/badge/HACS-Custom-orange.svg" alt="HACS"></a>
+  <a href="https://github.com/xpoh697/acogo/releases"><img src="https://img.shields.io/github/v/release/xpoh697/acogo?include_prereleases" alt="Release"></a>
+  <a href="https://github.com/xpoh697/acogo/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
+</p>
+
+**Автор:** [xpoh697](https://github.com/xpoh697)
 
 Интеграция для систем умных домофонов и модулей **ACO (acoGO! 2.0)** в **Home Assistant**.
 
