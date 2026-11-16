@@ -4634,3 +4634,35 @@ profit = today_house_consumption_cost + today_export_price - today_import_price
 1. **Fully Kiosk (`192.168.100.19:2323`)**: включить `usageStatistics=true` (откроет на планшете экран системного разрешения *Usage access* — нужно один раз включить тумблер для Fully Kiosk Browser); `injectJsCode` с `visibilitychange` не ставим.
 2. **`custom_components/acogo/coordinator.py`**: быстрый 1.5-сек локальный поллер `deviceInfo` с триггером **только** на переход в `"pl.aco.acogo"` (включая выход из скринсейвера), диагностическим `WARNING` при переходе в `"com.sec.android.app.launcher"` без Usage Access, мгновенным `reset_call_state()` при уходе с `"pl.aco.acogo"` и отменой задачи в `async_shutdown()`.
 3. **`custom_components/acogo/__init__.py` и `automations.yaml` (`id: '1790421777286'`)**: запуск `coordinator.start_kiosk_monitor()`, строгая проверка на `"pl.aco.acogo"` без `"com.sec.android.app.launcher"` и автоматический сброс после закрытия `acoGO!`.
+
+## [2026-11-16T12:24:01+01:00] Задача: чего теперь планцет моргает на экране, раньше отн просто притемнялся и висел в таком режиме, сеячас просто моргает и яркость на полную
+
+### Контекст диагностики (`192.168.100.19:2323` и `acogo.log`)
+- Штатные настройки заставки Fully Kiosk на планшете: `"timeToScreensaverV2": "300"` (5 минут), `"screensaverBrightness": "5"`, `"screenBrightness": 201`, `"keepScreenOn": true`, `"screensaverWallpaperURL": "http://192.168.100.5:8123"`.
+- В `12:20:21` были выполнены `cmd=screenOn`, `cmd=stopScreensaver` и дважды `cmd=setBooleanSetting` (`usageStatistics=true`, `setWifiWakelock=true`), из-за чего планшет вышел из заставки на яркость `201`.
+- В `12:21:12` при рестарте HA метод `_async_ensure_kiosk_settings()` в `coordinator.py` повторно вызвал `setBooleanSetting` (`usageStatistics=true`, `setWifiWakelock=true`), а в `12:21:48` обновился ресурс Lovelace `?v=1.2.0`.
+- По замерам с `12:34:17` по `12:35:37`: по истечении 300 секунд планшет сам вернулся в притемнённый режим (`screenBrightness=5`, `isInScreensaver=true`) и стабильно в нём удерживается (`diff` вырос от `1.769s` до `79.642s`, при этом `bright=5`, `ss=True` не сбрасываются).
+
+### Archi
+Причина моргания и яркости `201` между `12:20` и `12:24` — не сам 1.5-сек поллинг, а три события подряд:
+1. Вызов `stopScreensaver` в `12:20:21` вывел экран из заставки (`5` → `201`).
+2. Каждый вызов `setBooleanSetting` в Fully Kiosk переприменяет настройки активности Android (визуальное моргание экрана) и сбрасывает 300-секундный таймер `timeToScreensaverV2`.
+3. На рестарте HA (`12:21:12`) функция `_async_ensure_kiosk_settings()` в `coordinator.py` снова вызывала `setBooleanSetting` два раза подряд, плюс обновление Lovelace-ресурса `?v=1.2.0` перегрузило вкладку.
+Сейчас 300 секунд прошли и планшет уже снова притемнился (`bright=5`, `isInScreensaver=true`). Но чтобы при будущих рестартах HA экран никогда больше не моргал и не подскакивал на полную яркость, предлагаю убрать `_async_ensure_kiosk_settings()` из `coordinator.py`, так как `usageStatistics=true` и `setWifiWakelock=true` уже постоянно сохранены в памяти Fully Kiosk.
+
+### Skeptic
+Проверяем архитектуру с позиций SRE/надёжности (3 критических пункта):
+1. **Побочные эффекты мутирующих вызовов (`setBooleanSetting`) в цикле мониторинга:** Цикл `_async_kiosk_monitor_loop` обязан быть строго read-only (`GET ?cmd=deviceInfo`). Любой вызов `setBooleanSetting` при рестарте HA будит планшет из притемнённого режима (`bright=5` → `201`), вызывает визуальную вспышку активности Android и держит яркость `201` следующие 5 минут.
+2. **Подтверждение пассивности read-only поллинга `?cmd=deviceInfo`:** Необходимо убедиться по живым данным, что опрос `deviceInfo` раз в 1.5 сек не сбрасывает `lastUserInteractionTime` и не выводит экран из заставки. Замеры подтверждают: при работающем поллере `diff` таймера простоя стабильно растёт (`1.769s` → `18.999s` → `79.642s`), а планшет держит `bright=5` и `ss=True`.
+3. **Очистка неиспользуемого состояния:** При удалении `_async_ensure_kiosk_settings()` нужно также удалить поле `self._kiosk_configured_hosts` из `AcoGoDataUpdateCoordinator.__init__`, чтобы не оставлять мёртвый код и неиспользуемое состояние.
+
+### Итерация 2: Доработка Archi
+Принимаю все 3 пункта Skeptic:
+- Полностью удаляю метод `_async_ensure_kiosk_settings()` и множество `self._kiosk_configured_hosts` из `custom_components/acogo/coordinator.py`.
+- В `_async_kiosk_monitor_loop` остаётся только пассивный `GET {url}` с `params={"cmd": "deviceInfo", "type": "json", "password": password}` раз в `1.5` сек и таймаутом `1.5` сек — ни одного мутирующего вызова при старте или работе HA.
+
+### Skeptic (Финальное ревью)
+Подтверждаю: read-only мониторинг безопасен, не сбрасывает таймер заставки `timeToScreensaverV2=300`, не меняет яркость и не вызывает перерисовку окна Fully Kiosk при рестартах HA. Мёртвый код удалён. Консенсус достигнут за 2 итерации.
+
+### Заключение
+В `custom_components/acogo/coordinator.py` удаляются `_async_ensure_kiosk_settings()` и `self._kiosk_configured_hosts`, переводя `_async_kiosk_monitor_loop` в 100% read-only режим (`GET ?cmd=deviceInfo`). Ожидается подтверждение пользователя перед правкой кода.

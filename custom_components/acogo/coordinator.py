@@ -44,7 +44,6 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._preview_cooldown_until: dict[str, float] = {}
         self._kiosk_monitor_task: asyncio.Task[None] | None = None
         self._kiosk_prev_apps: dict[str, str] = {}
-        self._kiosk_configured_hosts: set[str] = set()
         self._kiosk_usage_warned: bool = False
         # Cache for last valid real camera frame (device_id -> (timestamp, jpeg_bytes))
         self.last_valid_snapshot: dict[str, tuple[float, bytes]] = {}
@@ -56,34 +55,6 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._async_kiosk_monitor_loop(),
                 "acogo_fully_kiosk_monitor",
             )
-
-    async def _async_ensure_kiosk_settings(
-        self,
-        session: aiohttp.ClientSession,
-        url: str,
-        password: str,
-        timeout: aiohttp.ClientTimeout,
-        verify_ssl: bool,
-    ) -> None:
-        """Enable usageStatistics and setWifiWakelock when Fully Kiosk wakes up."""
-        for setting_key in ("usageStatistics", "setWifiWakelock"):
-            params = {
-                "cmd": "setBooleanSetting",
-                "key": setting_key,
-                "value": "true",
-                "type": "json",
-                "password": password,
-            }
-            try:
-                async with session.get(
-                    url,
-                    params=params,
-                    timeout=timeout,
-                    ssl=verify_ssl,
-                ) as resp:
-                    _LOGGER.debug("Set Fully Kiosk %s=true (HTTP %s)", setting_key, resp.status)
-            except (aiohttp.ClientError, TimeoutError):
-                pass
 
     async def _async_kiosk_monitor_loop(self) -> None:
         """Poll Fully Kiosk deviceInfo every 1.5s for exact pl.aco.acogo call detection."""
@@ -113,12 +84,6 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             info = await resp.json(content_type=None)
                     except (aiohttp.ClientError, TimeoutError):
                         continue
-
-                    if host not in self._kiosk_configured_hosts:
-                        self._kiosk_configured_hosts.add(host)
-                        await self._async_ensure_kiosk_settings(
-                            session, url, password, timeout, verify_ssl
-                        )
 
                     if not isinstance(info, dict):
                         continue
