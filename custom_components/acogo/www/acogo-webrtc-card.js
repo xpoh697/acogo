@@ -1,7 +1,7 @@
 /**
  * acoGO! Live WebRTC Lovelace Card
  * Directly connects to AWS Kinesis Video Streams WebRTC for ultra-low latency intercom video feed.
- * Version: 1.1.8
+ * Version: 1.1.9
  */
 
 function safeBtoa(obj) {
@@ -166,7 +166,7 @@ class AcoGoWebRtcCard extends HTMLElement {
   static getStubConfig() {
     return {
       title: 'acoGO! Julianów',
-      device_id: '01:01:26:79'
+      device_id: '01:01:39:b1'
     };
   }
 
@@ -375,7 +375,7 @@ class AcoGoWebRtcCard extends HTMLElement {
               <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
             </svg>
             ${this._config.title}
-            <span class="version-badge">v1.1.8</span>
+            <span class="version-badge">v1.1.9</span>
           </div>
           <div id="statusBadge" class="badge badge-idle">${this._statusText}</div>
         </div>
@@ -849,4 +849,4 @@ window.customCards.push({
   name: 'acoGO! Live WebRTC Camera',
   description: 'Прямой видеопоток 30 FPS с домофона acoGO через браузерный WebRTC'
 });
-console.info('%c ACOGO-WEBRTC-CARD %c v1.1.8 Loaded ', 'background:#0284c7;color:#fff;font-weight:bold;', 'background:#0d121c;color:#10b981;');
+console.info('%c ACOGO-WEBRTC-CARD %c v1.1.9 Loaded ', 'background:#0284c7;color:#fff;font-weight:bold;', 'background:#0d121c;color:#10b981;');

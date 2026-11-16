@@ -4470,3 +4470,65 @@ profit = today_house_consumption_cost + today_export_price - today_import_price
 1. Зафиксировать аудит и дебаты в `DEBATE.md`.
 2. Предложить пользователю перечень найденных проблем и консолидированные исправления для `custom_components/acogo` (плюс проинформировать о сторонних ошибках в логах сервера для `ems` и `hon`).
 3. После одобрения пользователем — применить патч к локальным файлам, развернуть на сервер HA и очистить `__pycache__`.
+
+
+## [2026-11-16T11:25:22+01:00] Задача: Что с камерой и тригером входящего звонка удаться заставить работать?
+
+### Archi
+Проведена живая диагностика облака ACO (`api.aco.com.pl`), состояния сущностей Home Assistant, дашбордов Lovelace и файла `automations.yaml`. Оба механизма (и камера, и триггер входящего вызова) **полностью работоспособны** — найдены конкретные причины, почему они сейчас молчат:
+
+1. **Почему не работала камера WebRTC**:
+   - В облаке ACO у панели `acoGO! Julianów` сменился `devId`: сейчас активный идентификатор — **`01:01:39:b1`** (`"status": "online"`, `check-state` -> `200 {"response":"ready"}`).
+   - Прямой тестовый вызов `POST /preview/request` для `"01:01:39:b1"` успешно вернул **`HTTP 200 OK`** и живой `channel arn` (`arn:aws:kinesisvideo:eu-west-2:375409846789:channel/room-06/1738231550049`). То есть сама камера домофона отдаёт WebRTC-поток штатно!
+   - Однако в `.storage/lovelace.lovelace` (и в `getStubConfig()` карточки `acogo-webrtc-card.js`) зашит устаревший `device_id: "01:01:26:79"`, а также старые `door_entity: "lock.acogo_julianow_door"` и `gate_entity: "lock.acogo_julianow_gate"` (актуальные — `lock.ulitsa_acogo_julianow_door_lock` и `lock.ulitsa_acogo_julianow_gate_f2`).
+   - *Решение*: Добавить в `__init__.py` функцию `_resolve_device_id(coord, raw_device_id)`, которая при отсутствии переданного `device_id` в `coord.data` автоматически подставляет актуальный домофон (`01:01:39:b1`), плюс обновить конфиг карточки в `acogo-webrtc-card.js` и `.storage/lovelace.lovelace`.
+
+2. **Почему не работал триггер входящего звонка**:
+   - В `automations.yaml` (`id: '1790421777286'`, *«Домофон: Входящий звонок с калитки triger»*) в триггере по `sensor.sm_x110_last_notification` **забыт ключ `attribute: package`**, поэтому Home Assistant сравнивает текст уведомления со строкой `"pl.aco.acogo"`. Более того, такой триггер не срабатывает на второй звонок подряд, если `package` не изменился.
+   - Проверка живых состояний показала, что `sensor.sm_x110_last_notification` на планшете сейчас `unknown`, зато на планшете `TabA9` (`SM-X110`) работает **Fully Kiosk Browser**, отдающий сенсор `sensor.taba9_foreground_app` (`de.ozerov.fully`), а само приложение `pl.aco.acogo` (`v1.10.2`) зарегистрировано в облаке на `SM-X110` (`devId: c438a0132fac52d4`).
+   - *Решение*: Добавить встроенный тройной слушатель событий прямо в `custom_components/acogo/__init__.py` через `EVENT_STATE_CHANGED`:
+     1) Сенсоры `sensor.*_last_notification` (по `attributes["package"] == "pl.aco.acogo"`, срабатывает даже при повторных звонках подряд).
+     2) Сенсоры `sensor.*_foreground_app` (Fully Kiosk при всплытии экрана звонка `pl.aco.acogo` — без необходимости давать Android Notification Access).
+     3) Локальный Webhook `POST /api/webhook/acogo_incoming_call` (для MacroDroid/Tasker).
+
+---
+
+### Skeptic
+Критический разбор рисков предложенного решения:
+
+1. **Ложные срабатывания при перезагрузке HA и ручном входе в приложение (`foreground_app` / `last_notification`)**:
+   - При старте HA или восстановлении связи с планшетом сенсор `sensor.taba9_foreground_app` переходит из `unavailable`/`unknown` в `pl.aco.acogo` (если оно осталось открытым) — нельзя считать это звонком.
+   - Аналогично у `sensor.*_last_notification` при рестарте или обновлении несвязанных полей нельзя триггерить звонок, если `new_state.state` в `("unknown", "unavailable")`, или если не изменились ни текст/время уведомления (`post_time`), ни состояние.
+   *Требование*: Для `foreground_app` срабатывать только если `old_state` валидно (`not in ("unknown", "unavailable", "pl.aco.acogo")`) и `new_state.state == "pl.aco.acogo"`. Для `last_notification` срабатывать при `new_state.state not in ("unknown", "unavailable")` и `new_state.attributes.get("package") == "pl.aco.acogo"` (когда событие действительно обновило уведомление).
+
+2. **Скрытый сбой при устаревшем `device_id` в сервисах и карточке**:
+   - Сейчас `start_webrtc_stream`, `stop_webrtc_stream`, `capture_snapshot`, `send_order` и `switch_camera` принимают произвольный `device_id` из `call.data` напрямую. Если карточка Lovelace передала устаревший `"01:01:26:79"`, запрос уходит в облако на чужой/удалённый `devId`.
+   *Требование*: Вынести единый резолвер `_resolve_device_id(coord, raw_device_id)` в `__init__.py` (или `coordinator.py`): если переданный `raw_device_id` не найден в `coord.data`, логировать `WARNING` и безопасно подставлять первый доступный домофон из `coord.data` (игнорируя клиентские приложения `APP_MODELS`), а в `acogo-webrtc-card.js` при совпадении старых/невалидных `device_id`/`entity_id` автоматически переключаться на актуальные сущности.
+
+3. **Разрыв между интеграцией и локальной автоматизацией `1790421777286`**:
+   - Пока в `automations.yaml` висит сломанный триггер без `attribute: package`, пользователь в UI видит нерабочую автоматизацию.
+   *Требование*: Помимо встроенного детектора в `acogo`, поправить и саму автоматизацию `1790421777286` в `automations.yaml` (добавить `attribute: package` + триггер `sensor.taba9_foreground_app`), а также обновить конфиг карточки в `.storage/lovelace.lovelace`.
+
+---
+
+### Итерация 2: Доработка Archi
+Полный консенсус со Skeptic:
+1. В `custom_components/acogo/__init__.py`:
+   - Добавляем `_resolve_device_id(coord, raw_device_id)` и применяем во всех 5 сервисах (`start_webrtc_stream`, `stop_webrtc_stream`, `capture_snapshot`, `send_order`, `switch_camera`).
+   - Добавляем подписчик `EVENT_STATE_CHANGED` с фильтрами против ложных срабатываний (`old_state` guard для `*_foreground_app`, `unknown`/`unavailable` и `package == "pl.aco.acogo"` guard для `*_last_notification`), вызывающий `active_coord.async_handle_call_trigger(...)` (где уже работает 10-секундный cooldown).
+2. В `custom_components/acogo/www/acogo-webrtc-card.js`:
+   - Обновляем `getStubConfig()` (`device_id: '01:01:39:b1'`, актуальные `door_entity`/`gate_entity`), а также в `set hass` и fallback-кнопках учитываем актуальные имена сущностей.
+3. На сервере Home Assistant (после одобрения пользователем):
+   - Обновляем карточку в `.storage/lovelace.lovelace` (`01:01:39:b1`, актуальные `lock.*`) и чиним автоматизацию `1790421777286` в `automations.yaml`.
+
+---
+
+### Skeptic (Финальное ревью)
+Камера проверена живым запросом к AWS/ACO (`01:01:39:b1` отдаёт WebRTC), тройной триггер звонка (включая Fully Kiosk `sensor.taba9_foreground_app`, `last_notification` и Webhook) защищён от ложных срабатываний и повторов. Консенсус достигнут.
+
+---
+
+### Заключение
+1. Зафиксировать диагностику и дебаты в `DEBATE.md`.
+2. Объяснить пользователю точные причины по камере (`01:01:26:79` -> `01:01:39:b1`) и триггеру звонка (`automations.yaml` без `attribute: package` + `sensor.sm_x110_last_notification == unknown` при живом Fully Kiosk `sensor.taba9_foreground_app`).
+3. Предложить консолидированный код для `__init__.py`, `acogo-webrtc-card.js`, `lovelace.lovelace` и `automations.yaml`, и после подтверждения пользователем — применить и проверить.

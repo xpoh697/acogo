@@ -19,15 +19,17 @@ from homeassistant.const import (
     CONF_PASSWORD,
     CONF_USERNAME,
     EVENT_HOMEASSISTANT_STARTED,
+    EVENT_STATE_CHANGED,
     Platform,
 )
-from homeassistant.core import CoreState, HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.core import CoreState, Event, HomeAssistant, ServiceCall, SupportsResponse, callback
 from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers import aiohttp_client
 from homeassistant.helpers.event import async_track_time_interval
 
 from .api import AcoGoApiClient, AcoGoAuthError
 from .const import (
+    APP_MODELS,
     CONF_DEV_ID,
     CONF_DEVICE_PASSWORD,
     DOMAIN,
@@ -152,6 +154,26 @@ def _get_active_entry_runtime(
     return None
 
 
+def _resolve_device_id(
+    coord: AcoGoDataUpdateCoordinator, raw_device_id: str | None
+) -> str | None:
+    """Resolve an intercom device_id, falling back to the active panel if stale/omitted."""
+    data = coord.data or {}
+    if raw_device_id and raw_device_id in data:
+        return raw_device_id
+
+    for dev_id, dev_data in data.items():
+        if dev_data.get("info", {}).get("model") not in APP_MODELS:
+            if raw_device_id:
+                _LOGGER.warning(
+                    "Requested device_id '%s' not found in active devices; using '%s'",
+                    raw_device_id,
+                    dev_id,
+                )
+            return dev_id
+    return next(iter(data), None)
+
+
 def _cancel_orphaned_snapshot_timers(hass: HomeAssistant) -> None:
     """Cancel any orphaned interval timers left over from pre-v1.1.8 reloads."""
     try:
@@ -239,13 +261,44 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "coordinator": coordinator,
     }
 
+    # Built-in state listener for tablet notification & Fully Kiosk foreground_app call triggers
+    @callback
+    def _async_on_tablet_state_changed(event: Event[Any]) -> None:
+        """Detect incoming acoGO call from notification or Fully Kiosk foreground_app sensors."""
+        entity_id: str = event.data.get("entity_id") or ""
+        new_state = event.data.get("new_state")
+        old_state = event.data.get("old_state")
+        if new_state is None or new_state.state in ("unknown", "unavailable"):
+            return
+
+        if entity_id.endswith("_last_notification"):
+            if old_state is not None and new_state.attributes.get("package") == "pl.aco.acogo":
+                hass.async_create_task(
+                    coordinator.async_handle_call_trigger(source=entity_id)
+                )
+        elif entity_id.endswith("_foreground_app"):
+            if (
+                old_state is not None
+                and old_state.state not in ("unknown", "unavailable", "pl.aco.acogo")
+                and new_state.state == "pl.aco.acogo"
+            ):
+                hass.async_create_task(
+                    coordinator.async_handle_call_trigger(source=entity_id)
+                )
+
+    entry.async_on_unload(
+        hass.bus.async_listen(EVENT_STATE_CHANGED, _async_on_tablet_state_changed)
+    )
+
     # Register custom service: send_order
     async def async_handle_send_order(call: ServiceCall) -> None:
         runtime = _get_active_entry_runtime(hass)
         if not runtime:
             raise HomeAssistantError("acoGO integration is not ready")
         active_api, active_coord = runtime
-        device_id: str = call.data["device_id"]
+        device_id = _resolve_device_id(active_coord, call.data.get("device_id"))
+        if not device_id:
+            raise HomeAssistantError("Intercom device not found")
         order_id: str = call.data["order_id"]
         _LOGGER.info("Executing custom acoGO order '%s' for device %s", order_id, device_id)
         try:
@@ -262,8 +315,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         runtime = _get_active_entry_runtime(hass)
         if not runtime:
             raise HomeAssistantError("acoGO integration is not ready")
-        active_api, _ = runtime
-        device_id: str = call.data["device_id"]
+        active_api, active_coord = runtime
+        device_id = _resolve_device_id(active_coord, call.data.get("device_id"))
+        if not device_id:
+            raise HomeAssistantError("Intercom device not found")
         _LOGGER.info("Switching camera for device %s", device_id)
         try:
             await active_api.switch_video(device_id)
@@ -278,7 +333,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not runtime:
             raise HomeAssistantError("acoGO integration is not ready")
         _, active_coord = runtime
-        device_id = call.data.get("device_id")
+        device_id = _resolve_device_id(active_coord, call.data.get("device_id"))
         await active_coord.async_handle_call_trigger(device_id=device_id, source="service")
 
     hass.services.async_register(DOMAIN, SERVICE_TRIGGER_INCOMING_CALL, async_handle_trigger_call)
@@ -290,7 +345,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             return web.Response(status=503, text="Coordinator not ready")
         _, active_coord = runtime
 
-        device_id = None
+        raw_device_id = None
         action = "ring"
         try:
             if request.can_read_body:
@@ -298,11 +353,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 if text and text.strip():
                     body = json.loads(text)
                     if isinstance(body, dict):
-                        device_id = body.get("device_id")
+                        raw_device_id = body.get("device_id")
                         action = body.get("action", "ring")
         except Exception:
             pass
 
+        device_id = _resolve_device_id(active_coord, raw_device_id)
         if action == "cancel" and device_id:
             active_coord.reset_call_state(device_id)
             return web.json_response({"status": "cancelled"})
@@ -332,7 +388,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             raise HomeAssistantError("acoGO integration is not ready")
         _, active_coord = runtime
 
-        device_id = call.data.get("device_id") or next(iter(active_coord.data or {}), None)
+        device_id = _resolve_device_id(active_coord, call.data.get("device_id"))
         if not device_id:
             raise HomeAssistantError("Intercom device not found")
 
@@ -380,7 +436,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not runtime:
             return
         _, active_coord = runtime
-        device_id = call.data.get("device_id") or next(iter(active_coord.data or {}), None)
+        device_id = _resolve_device_id(active_coord, call.data.get("device_id"))
         if device_id:
             await active_coord.async_stop_preview(device_id)
 
@@ -394,7 +450,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             raise HomeAssistantError("acoGO integration is not ready")
         _, active_coord = runtime
 
-        device_id = call.data.get("device_id") or next(iter(active_coord.data or {}), None)
+        device_id = _resolve_device_id(active_coord, call.data.get("device_id"))
         if not device_id:
             raise HomeAssistantError("Intercom device not found")
 

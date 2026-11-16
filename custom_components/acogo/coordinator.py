@@ -132,15 +132,18 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def async_handle_call_trigger(self, device_id: str | None = None, source: str = "webhook") -> bool:
         """Handle incoming call trigger from webhook or automation with cooldown and auto-reset."""
         now_ts = asyncio.get_running_loop().time()
-        target_dev_id = device_id
-        if not target_dev_id and self.data:
-            for dev_id, dev_data in self.data.items():
+        data = self.data or {}
+        target_dev_id = device_id if (device_id and device_id in data) else None
+        if not target_dev_id:
+            for dev_id, dev_data in data.items():
                 model = dev_data.get("info", {}).get("model")
                 if model not in APP_MODELS:
                     target_dev_id = dev_id
                     break
+            if not target_dev_id:
+                target_dev_id = next(iter(data), None)
 
-        if not target_dev_id or not self.data or target_dev_id not in self.data:
+        if not target_dev_id or target_dev_id not in data:
             _LOGGER.warning("Call trigger received but no intercom device found in coordinator data")
             return False
 
@@ -154,10 +157,10 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._call_latch_until[target_dev_id] = now_ts + ring_duration
         self._call_cooldown_until[target_dev_id] = now_ts + 10.0
 
-        dev_name = self.data[target_dev_id].get("info", {}).get("name", target_dev_id)
+        dev_name = data[target_dev_id].get("info", {}).get("name", target_dev_id)
         _LOGGER.info("Doorbell incoming call triggered via %s for %s (%s)!", source, target_dev_id, dev_name)
 
-        self.data[target_dev_id]["is_ringing"] = True
+        data[target_dev_id]["is_ringing"] = True
         self.async_update_listeners()
 
         self.hass.bus.async_fire(EVENT_INCOMING_CALL, {
