@@ -70,16 +70,24 @@ class AcoGoOpenButton(CoordinatorEntity[AcoGoDataUpdateCoordinator], ButtonEntit
             "identifiers": {(DOMAIN, self.dev_id)},
             "name": info.get("name", f"ACO Intercom {self.dev_id}"),
             "manufacturer": "ACO",
+            "model": f"Model {info.get('model', 'Unknown')}",
+            "sw_version": info.get("software", "Unknown"),
         }
 
     async def async_press(self) -> None:
         """Trigger opening sequence."""
+        was_ringing = bool((self.coordinator.data or {}).get(self.dev_id, {}).get("is_ringing", False))
         try:
-            self.coordinator.reset_call_state(self.dev_id)
-            await self.coordinator.api.open_door_sequence(self.dev_id, is_gate=self.is_gate)
+            await self.coordinator.api.open_door_sequence(
+                self.dev_id,
+                is_gate=self.is_gate,
+                is_active_call=True if was_ringing else None,
+            )
         except AcoGoApiError as err:
             action = "ворот" if self.is_gate else "двери"
             raise HomeAssistantError(f"Ошибка открытия {action}: {err}") from err
+        finally:
+            self.coordinator.reset_call_state(self.dev_id)
 
 
 class AcoGoSwitchCameraButton(CoordinatorEntity[AcoGoDataUpdateCoordinator], ButtonEntity):
@@ -101,6 +109,8 @@ class AcoGoSwitchCameraButton(CoordinatorEntity[AcoGoDataUpdateCoordinator], But
             "identifiers": {(DOMAIN, self.dev_id)},
             "name": info.get("name", f"ACO Intercom {self.dev_id}"),
             "manufacturer": "ACO",
+            "model": f"Model {info.get('model', 'Unknown')}",
+            "sw_version": info.get("software", "Unknown"),
         }
 
     async def async_press(self) -> None:

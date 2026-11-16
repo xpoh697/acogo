@@ -423,7 +423,6 @@ async def async_capture_webrtc_snapshot(
     timeout: float = 25.0,
 ) -> bytes | None:
     """Connect as WebRTC viewer to AWS KVS and capture one video frame as JPEG."""
-    setup_acogo_file_logger()
 
     try:
         import aiohttp

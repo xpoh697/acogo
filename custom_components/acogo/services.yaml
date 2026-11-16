@@ -17,12 +17,12 @@ capture_snapshot:
         text:
     timeout:
       name: Таймаут (сек)
-      description: Максимальное время ожидания кадра (по умолчанию 5 секунд).
-      default: 5.0
+      description: Максимальное время ожидания кадра (по умолчанию 20 секунд).
+      default: 20.0
       selector:
         number:
           min: 2
-          max: 15
+          max: 30
           step: 1
           unit_of_measurement: seconds
 
@@ -47,6 +47,7 @@ stop_webrtc_stream:
       example: "01:01:26:79"
       selector:
         text:
+
 trigger_incoming_call:
   name: Инициировать входящий звонок
   description: Программно активирует статус входящего звонка домофона acoGO (по вебхуку или событию с планшета).
@@ -54,6 +55,43 @@ trigger_incoming_call:
     device_id:
       name: ID устройства
       description: devId домофона (если не указан, берется первый доступный домофон).
+      example: "01:01:26:79"
+      selector:
+        text:
+
+send_order:
+  name: Отправить команду домофону
+  description: Отправляет низкоуровневую команду orderId в облако acoGO для указанного устройства.
+  fields:
+    device_id:
+      name: ID устройства
+      description: devId домофона.
+      required: true
+      example: "01:01:26:79"
+      selector:
+        text:
+    order_id:
+      name: Команда (orderId)
+      description: Идентификатор команды ACO (ezOpen, f2Open, receiveCall, rejectCall, endCall).
+      required: true
+      example: "ezOpen"
+      selector:
+        select:
+          options:
+            - "ezOpen"
+            - "f2Open"
+            - "receiveCall"
+            - "rejectCall"
+            - "endCall"
+
+switch_camera:
+  name: Переключить видеовход камеры
+  description: Циклически переключает видеовходы на панелях серии PRO (с модулем PRO-VIDEO-SW2-60).
+  fields:
+    device_id:
+      name: ID устройства
+      description: devId домофона.
+      required: true
       example: "01:01:26:79"
       selector:
         text:

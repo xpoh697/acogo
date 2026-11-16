@@ -25,7 +25,7 @@ async def async_setup_entry(
     coordinator: AcoGoDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
 
     entities: list[LockEntity] = []
-    for dev_id, dev_data in coordinator.data.items():
+    for dev_id in coordinator.data:
         entities.append(AcoGoLock(coordinator, dev_id, is_gate=False))
         entities.append(AcoGoLock(coordinator, dev_id, is_gate=True))
 
@@ -63,13 +63,18 @@ class AcoGoLock(CoordinatorEntity[AcoGoDataUpdateCoordinator], LockEntity):
 
     async def async_unlock(self, **kwargs: Any) -> None:
         """Unlock door or gate."""
+        was_ringing = bool((self.coordinator.data or {}).get(self.dev_id, {}).get("is_ringing", False))
         self._attr_is_locked = False
         self.async_write_ha_state()
 
         try:
-            self.coordinator.reset_call_state(self.dev_id)
-            await self.coordinator.api.open_door_sequence(self.dev_id, is_gate=self.is_gate)
+            await self.coordinator.api.open_door_sequence(
+                self.dev_id,
+                is_gate=self.is_gate,
+                is_active_call=True if was_ringing else None,
+            )
         finally:
+            self.coordinator.reset_call_state(self.dev_id)
             self._attr_is_locked = True
             self.async_write_ha_state()
 

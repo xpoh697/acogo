@@ -148,6 +148,7 @@ class AcoGoApiClient:
     ) -> Any:
         """Send authenticated request to ACO GO API with automatic 401 recovery."""
         url = f"{BASE_URL}{path}"
+        used_password = self.device_password
         headers = self._get_headers()
         timeout = custom_timeout or API_TIMEOUT
 
@@ -155,8 +156,10 @@ class AcoGoApiClient:
             async with self.session.request(method, url, json=json, headers=headers, timeout=timeout) as resp:
                 if resp.status == 401 and retry_on_401 and self.username and self.password:
                     async with self._auth_lock:
-                        _LOGGER.info("Session expired (401), re-authenticating device...")
-                        await self.register_device()
+                        # Only re-register if another concurrent caller has not already rotated the password.
+                        if self.device_password == used_password:
+                            _LOGGER.info("Session expired (401), re-authenticating device...")
+                            await self.register_device()
                         headers = self._get_headers()
                         async with self.session.request(method, url, json=json, headers=headers, timeout=timeout) as retry_resp:
                             if retry_resp.status not in (200, 201, 202):
@@ -207,14 +210,20 @@ class AcoGoApiClient:
         )
         return True
 
-    async def open_door_sequence(self, target_id: str, is_gate: bool = False) -> bool:
+    async def open_door_sequence(
+        self,
+        target_id: str,
+        is_gate: bool = False,
+        is_active_call: bool | None = None,
+    ) -> bool:
         """Safely execute door/gate unlock with device locking and guaranteed endCall."""
         lock = self.get_device_lock(target_id)
         order_cmd = ORDER_EZ_OPEN if is_gate else ORDER_F2_OPEN
 
         async with lock:
-            state = await self.check_state(target_id)
-            is_active_call = (state == "busy")
+            if is_active_call is None:
+                state = await self.check_state(target_id)
+                is_active_call = (state == "busy")
 
             if is_active_call:
                 return await self.send_order(target_id, order_cmd)
@@ -235,7 +244,13 @@ class AcoGoApiClient:
         """Switch camera video input on intercom with lock protection."""
         lock = self.get_device_lock(target_id)
         async with lock:
-            await self._request("POST", "/order/video-sw", json={"targetId": target_id})
+            # Basic models reject /order/video-sw with 401; do not trigger token rotation on unsupported hardware.
+            await self._request(
+                "POST",
+                "/order/video-sw",
+                json={"targetId": target_id},
+                retry_on_401=False,
+            )
             return True
 
     async def request_preview(self, device_id: str, preview_type: str = "video-only") -> dict[str, Any]:

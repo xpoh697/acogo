@@ -1,7 +1,7 @@
 """Constants for the acoGO integration."""
 
 DOMAIN = "acogo"
-VERSION = "1.1.7"
+VERSION = "1.1.8"
 
 BASE_URL = "https://api.aco.com.pl/listener/v1"
 
@@ -36,6 +36,7 @@ CALL_COOLDOWN_DURATION = 25.0
 APP_MODELS = {62, 63}
 PRO_MODELS = {65, 67, 68}
 STANDARD_MODELS = {64, 66}
+
 # Webhook and call events
 WEBHOOK_ID = "acogo_incoming_call"
 SERVICE_TRIGGER_INCOMING_CALL = "trigger_incoming_call"

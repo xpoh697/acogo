@@ -55,6 +55,8 @@ class AcoGoConnectivitySensor(CoordinatorEntity[AcoGoDataUpdateCoordinator], Bin
             "identifiers": {(DOMAIN, self.dev_id)},
             "name": info.get("name", f"ACO Intercom {self.dev_id}"),
             "manufacturer": "ACO",
+            "model": f"Model {info.get('model', 'Unknown')}",
+            "sw_version": info.get("software", "Unknown"),
         }
 
 
@@ -92,4 +94,6 @@ class AcoGoCallSensor(CoordinatorEntity[AcoGoDataUpdateCoordinator], BinarySenso
             "identifiers": {(DOMAIN, self.dev_id)},
             "name": info.get("name", f"ACO Intercom {self.dev_id}"),
             "manufacturer": "ACO",
+            "model": f"Model {info.get('model', 'Unknown')}",
+            "sw_version": info.get("software", "Unknown"),
         }

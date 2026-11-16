@@ -1,8 +1,9 @@
 """The acoGO integration."""
 from __future__ import annotations
 
-import asyncio
 from datetime import timedelta
+import importlib.util
+import json
 import logging
 from pathlib import Path
 import time
@@ -31,9 +32,6 @@ from .const import (
     CONF_DEVICE_PASSWORD,
     DOMAIN,
     ORDER_END_CALL,
-    ORDER_EZ_OPEN,
-    ORDER_F2_OPEN,
-    ORDER_RECEIVE_CALL,
     ORDER_REJECT_CALL,
     SERVICE_TRIGGER_INCOMING_CALL,
     VERSION,
@@ -87,14 +85,12 @@ async def _async_register_card(hass: HomeAssistant) -> None:
     """Register the Lovelace card with Lovelace resources and frontend."""
     card_url = f"/api/{DOMAIN}/static/acogo-webrtc-card.js?v={VERSION}"
 
-    # 1. Direct injection into all dashboards immediately (works across all Lovelace modes)
     try:
         frontend.add_extra_js_url(hass, card_url)
         _LOGGER.debug("Registered acoGO card via add_extra_js_url: %s", card_url)
     except Exception as err:
         _LOGGER.warning("Failed to register acoGO card via add_extra_js_url: %s", err)
 
-    # 2. Register in Lovelace storage resources
     registered = await _async_register_lovelace_resource(hass, card_url)
     if registered:
         _LOGGER.info("Registered acoGO Lovelace resource: %s", card_url)
@@ -146,9 +142,46 @@ async def _async_register_lovelace_resource(hass: HomeAssistant, url: str) -> bo
         return False
 
 
+def _get_active_entry_runtime(
+    hass: HomeAssistant,
+) -> tuple[AcoGoApiClient, AcoGoDataUpdateCoordinator] | None:
+    """Return the active (api, coordinator) pair for acoGO from hass.data."""
+    for value in hass.data.get(DOMAIN, {}).values():
+        if isinstance(value, dict) and "coordinator" in value and "api" in value:
+            return value["api"], value["coordinator"]
+    return None
+
+
+def _cancel_orphaned_snapshot_timers(hass: HomeAssistant) -> None:
+    """Cancel any orphaned interval timers left over from pre-v1.1.8 reloads."""
+    try:
+        for handle in list(getattr(hass.loop, "_scheduled", ())):
+            if not handle.cancelled() and "_async_background_snapshot_refresh" in repr(handle):
+                handle.cancel()
+                _LOGGER.info("Cancelled orphaned legacy acoGO background refresh timer")
+    except Exception as err:
+        _LOGGER.debug("Timer sweep skipped: %s", err)
+
+
+def _safe_unregister_webhook(hass: HomeAssistant, exclude_entry_id: str | None = None) -> None:
+    """Unregister the incoming call webhook if no other acoGO entries remain."""
+    domain_data = hass.data.get(DOMAIN, {})
+    has_other_entries = any(
+        isinstance(val, dict) and key != exclude_entry_id and "coordinator" in val
+        for key, val in domain_data.items()
+    )
+    if has_other_entries:
+        return
+    try:
+        webhook.async_unregister(hass, WEBHOOK_ID)
+    except Exception:
+        pass
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up acoGO from a config entry."""
-    setup_acogo_file_logger()
+    await hass.async_add_executor_job(setup_acogo_file_logger)
+    _cancel_orphaned_snapshot_timers(hass)
 
     hass.data.setdefault(DOMAIN, {})
 
@@ -201,9 +234,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = AcoGoDataUpdateCoordinator(hass, api)
     await coordinator.async_config_entry_first_refresh()
 
-    # Start high-frequency line state monitor for instant call detection
-    coordinator.start_line_monitor()
-
     hass.data[DOMAIN][entry.entry_id] = {
         "api": api,
         "coordinator": coordinator,
@@ -211,11 +241,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Register custom service: send_order
     async def async_handle_send_order(call: ServiceCall) -> None:
+        runtime = _get_active_entry_runtime(hass)
+        if not runtime:
+            raise HomeAssistantError("acoGO integration is not ready")
+        active_api, active_coord = runtime
         device_id: str = call.data["device_id"]
         order_id: str = call.data["order_id"]
         _LOGGER.info("Executing custom acoGO order '%s' for device %s", order_id, device_id)
         try:
-            await api.send_order(device_id, order_id)
+            await active_api.send_order(device_id, order_id)
+            if order_id in (ORDER_END_CALL, ORDER_REJECT_CALL):
+                active_coord.reset_call_state(device_id)
         except Exception as err:
             raise HomeAssistantError(f"Failed to execute order '{order_id}': {err}") from err
 
@@ -223,10 +259,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Register custom service: switch_camera
     async def async_handle_switch_camera(call: ServiceCall) -> None:
+        runtime = _get_active_entry_runtime(hass)
+        if not runtime:
+            raise HomeAssistantError("acoGO integration is not ready")
+        active_api, _ = runtime
         device_id: str = call.data["device_id"]
         _LOGGER.info("Switching camera for device %s", device_id)
         try:
-            await api.switch_video(device_id)
+            await active_api.switch_video(device_id)
         except Exception as err:
             raise HomeAssistantError(f"Failed to switch camera: {err}") from err
 
@@ -234,58 +274,69 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Register custom service: trigger_incoming_call
     async def async_handle_trigger_call(call: ServiceCall) -> None:
+        runtime = _get_active_entry_runtime(hass)
+        if not runtime:
+            raise HomeAssistantError("acoGO integration is not ready")
+        _, active_coord = runtime
         device_id = call.data.get("device_id")
-        await coordinator.async_handle_call_trigger(device_id=device_id, source="service")
+        await active_coord.async_handle_call_trigger(device_id=device_id, source="service")
 
     hass.services.async_register(DOMAIN, SERVICE_TRIGGER_INCOMING_CALL, async_handle_trigger_call)
 
-    # Register native webhook for wall tablet
+    # Register native webhook for wall tablet (always binds dynamically to active coordinator)
     async def async_handle_webhook(hass: HomeAssistant, webhook_id: str, request: web.Request) -> web.Response:
+        runtime = _get_active_entry_runtime(hass)
+        if not runtime:
+            return web.Response(status=503, text="Coordinator not ready")
+        _, active_coord = runtime
+
         device_id = None
         action = "ring"
         try:
             if request.can_read_body:
                 text = await request.text()
                 if text and text.strip():
-                    try:
-                        import json as json_lib
-                        body = json_lib.loads(text)
-                        if isinstance(body, dict):
-                            device_id = body.get("device_id")
-                            action = body.get("action", "ring")
-                    except Exception:
-                        pass
+                    body = json.loads(text)
+                    if isinstance(body, dict):
+                        device_id = body.get("device_id")
+                        action = body.get("action", "ring")
         except Exception:
             pass
 
         if action == "cancel" and device_id:
-            coordinator.reset_call_state(device_id)
+            active_coord.reset_call_state(device_id)
             return web.json_response({"status": "cancelled"})
 
-        success = await coordinator.async_handle_call_trigger(device_id=device_id, source="webhook")
+        success = await active_coord.async_handle_call_trigger(device_id=device_id, source="webhook")
         return web.json_response({"status": "ok" if success else "ignored"})
 
     try:
-        webhook.async_register(
-            hass,
-            DOMAIN,
-            "acoGO Incoming Call",
-            WEBHOOK_ID,
-            async_handle_webhook,
-            local_only=True,
-        )
-        _LOGGER.debug("Registered acoGO call webhook: %s", WEBHOOK_ID)
-    except ValueError:
+        webhook.async_unregister(hass, WEBHOOK_ID)
+    except Exception:
         pass
-
+    webhook.async_register(
+        hass,
+        DOMAIN,
+        "acoGO Incoming Call",
+        WEBHOOK_ID,
+        async_handle_webhook,
+        local_only=True,
+    )
+    entry.async_on_unload(lambda: _safe_unregister_webhook(hass, exclude_entry_id=entry.entry_id))
+    _LOGGER.debug("Registered acoGO call webhook: %s", WEBHOOK_ID)
 
     # Register custom service: start_webrtc_stream
     async def async_handle_start_stream(call: ServiceCall) -> dict[str, Any]:
-        device_id = call.data.get("device_id") or next(iter(coordinator.data), None)
+        runtime = _get_active_entry_runtime(hass)
+        if not runtime:
+            raise HomeAssistantError("acoGO integration is not ready")
+        _, active_coord = runtime
+
+        device_id = call.data.get("device_id") or next(iter(active_coord.data or {}), None)
         if not device_id:
             raise HomeAssistantError("Intercom device not found")
 
-        params = await coordinator.async_start_preview(device_id)
+        params = await active_coord.async_start_preview(device_id)
         aws = params.get("aws", {})
         if not aws or not aws.get("channel arn"):
             raise HomeAssistantError("Failed to obtain valid AWS streaming credentials from acoGO Cloud")
@@ -325,16 +376,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Register custom service: stop_webrtc_stream
     async def async_handle_stop_stream(call: ServiceCall) -> None:
-        device_id = call.data.get("device_id") or next(iter(coordinator.data), None)
+        runtime = _get_active_entry_runtime(hass)
+        if not runtime:
+            return
+        _, active_coord = runtime
+        device_id = call.data.get("device_id") or next(iter(active_coord.data or {}), None)
         if device_id:
-            await coordinator.async_stop_preview(device_id)
+            await active_coord.async_stop_preview(device_id)
 
     hass.services.async_register(DOMAIN, "stop_webrtc_stream", async_handle_stop_stream)
 
     # Register custom service: capture_snapshot
     async def async_handle_capture_snapshot(call: ServiceCall) -> dict[str, Any]:
         """Capture video snapshot with fallback to last real camera image if live stream busy."""
-        device_id = call.data.get("device_id") or next(iter(coordinator.data), None)
+        runtime = _get_active_entry_runtime(hass)
+        if not runtime:
+            raise HomeAssistantError("acoGO integration is not ready")
+        _, active_coord = runtime
+
+        device_id = call.data.get("device_id") or next(iter(active_coord.data or {}), None)
         if not device_id:
             raise HomeAssistantError("Intercom device not found")
 
@@ -349,21 +409,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         await hass.async_add_executor_job(target_path.parent.mkdir, 0o755, True, True)
 
-        params = await coordinator.async_start_preview(device_id, retry_count=3)
-        aws = params.get("aws") if isinstance(params, dict) else None
-
         jpeg_bytes: bytes | None = None
+        has_aiortc = importlib.util.find_spec("aiortc") is not None
 
-        # If AWS credentials are valid, capture live WebRTC frame
-        if isinstance(aws, dict) and aws.get("access key ID") and aws.get("channel arn"):
-            from .webrtc import async_capture_webrtc_snapshot
-            jpeg_bytes = await async_capture_webrtc_snapshot(session, aws, timeout=timeout)
-            if jpeg_bytes:
-                coordinator.last_valid_snapshot[device_id] = (time.time(), jpeg_bytes)
+        if has_aiortc:
+            params = await active_coord.async_start_preview(device_id, retry_count=3)
+            aws = params.get("aws") if isinstance(params, dict) else None
+
+            if isinstance(aws, dict) and aws.get("access key ID") and aws.get("channel arn"):
+                from .webrtc import async_capture_webrtc_snapshot
+                jpeg_bytes = await async_capture_webrtc_snapshot(session, aws, timeout=timeout)
+                if jpeg_bytes:
+                    active_coord.last_valid_snapshot[device_id] = (time.time(), jpeg_bytes)
+
+            is_ringing = (active_coord.data or {}).get(device_id, {}).get("is_ringing", False)
+            if not is_ringing:
+                await active_coord.async_stop_preview(device_id)
 
         # Fallback 1: Use last captured valid real frame if fresh (TTL < 15 min = 900s)
         if not jpeg_bytes:
-            cached_entry = coordinator.last_valid_snapshot.get(device_id)
+            cached_entry = active_coord.last_valid_snapshot.get(device_id)
             if cached_entry:
                 cached_time, cached_bytes = cached_entry
                 if time.time() - cached_time < 900.0:
@@ -373,7 +438,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # Fallback 2: Generate status graphic card if no real frame available
         if not jpeg_bytes:
             from .webrtc import generate_snapshot_fallback_card
-            info = coordinator.data.get(device_id, {}).get("info", {})
+            info = (active_coord.data or {}).get(device_id, {}).get("info", {})
             panel_name = info.get("name", f"acoGO {device_id}")
             jpeg_bytes = await hass.async_add_executor_job(generate_snapshot_fallback_card, panel_name)
 
@@ -382,10 +447,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 f.write(data)
 
         await hass.async_add_executor_job(_write_file, target_path, jpeg_bytes)
-
-        is_ringing = coordinator.data.get(device_id, {}).get("is_ringing", False)
-        if not is_ringing:
-            await coordinator.async_stop_preview(device_id)
 
         _LOGGER.info("Saved acoGO snapshot to %s (%d bytes)", target_path, len(jpeg_bytes))
         return {
@@ -401,10 +462,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         supports_response=SupportsResponse.OPTIONAL,
     )
 
-    # Periodic background snapshot refresher (every 10 minutes) so fresh camera frame is always ready
+    # Periodic background snapshot refresher (every 10 minutes), only if aiortc is available
     async def _async_background_snapshot_refresh(*_: Any) -> None:
-        for dev_id in coordinator.data:
-            if not coordinator.is_preview_active(dev_id) and not coordinator.data.get(dev_id, {}).get("is_ringing"):
+        if not coordinator.data:
+            return
+        for dev_id, dev_data in list(coordinator.data.items()):
+            if (
+                dev_data.get("is_online")
+                and not coordinator.is_preview_active(dev_id)
+                and not dev_data.get("is_ringing")
+            ):
                 try:
                     p = await coordinator.async_start_preview(dev_id, retry_count=1)
                     aws_p = p.get("aws")
@@ -419,8 +486,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 finally:
                     await coordinator.async_stop_preview(dev_id)
 
-    # Run background refresh every 10 minutes
-    async_track_time_interval(hass, _async_background_snapshot_refresh, timedelta(minutes=10))
+    if importlib.util.find_spec("aiortc") is not None:
+        entry.async_on_unload(
+            async_track_time_interval(hass, _async_background_snapshot_refresh, timedelta(minutes=10))
+        )
+    else:
+        _LOGGER.debug("Skipping background WebRTC snapshot refresh: 'aiortc' is not installed")
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
@@ -428,24 +499,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
-    data = hass.data[DOMAIN].get(entry.entry_id, {})
+    data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
     coordinator: AcoGoDataUpdateCoordinator | None = data.get("coordinator")
     if coordinator:
-        coordinator.stop_line_monitor()
+        coordinator.async_shutdown()
 
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
-        hass.data[DOMAIN].pop(entry.entry_id)
-        if not hass.data[DOMAIN]:
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+        has_active_entries = any(
+            isinstance(val, dict) and "coordinator" in val
+            for val in hass.data.get(DOMAIN, {}).values()
+        )
+        if not has_active_entries:
             hass.services.async_remove(DOMAIN, "start_webrtc_stream")
             hass.services.async_remove(DOMAIN, "stop_webrtc_stream")
             hass.services.async_remove(DOMAIN, "capture_snapshot")
             hass.services.async_remove(DOMAIN, "send_order")
             hass.services.async_remove(DOMAIN, "switch_camera")
-            try:
-                webhook.async_unregister(hass, WEBHOOK_ID)
-            except Exception:
-                pass
             hass.services.async_remove(DOMAIN, SERVICE_TRIGGER_INCOMING_CALL)
+            _safe_unregister_webhook(hass)
 
     return unload_ok

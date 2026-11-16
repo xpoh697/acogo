@@ -4393,3 +4393,80 @@ profit = today_house_consumption_cost + today_export_price - today_import_price
 ### Заключение
 1. Зафиксировать дебаты в `DEBATE.md`.
 2. Предоставить пользователю пошаговую инструкцию по активации разрешений в Android на планшете Samsung.
+
+
+## [2026-11-16T10:46:25+01:00] Задача: Посмотри на косяки интеграцию
+
+### Archi
+Проведен полный аудит исходного кода `custom_components/acogo` (v1.1.7) на соответствие `technical_specification.md` и анализ живых логов сервера Home Assistant (`acogo.log` и `core/logs`).
+
+Выявленные проблемы и предложения по их устранению:
+1. **Холостой фоновый опрос камеры каждые 10 минут без `aiortc` + дублирование таймеров (`__init__.py`)**:
+   - В `manifest.json` указано `"requirements": []`, библиотека `aiortc` в системе Home Assistant не установлена.
+   - Фоновая задача `_async_background_snapshot_refresh` сначала будит вызывную панель запросом `POST /preview/request`, занимает видеолинию, и только внутри `async_capture_webrtc_snapshot` ловит `No module named 'aiortc'`. В живых логах это предупреждение сыпется каждые 10 минут, причем парами (`:10:51` и `:12:31`, `:20:51` и `:22:31` и т.д.).
+   - Причина дублирования: `async_track_time_interval` не привязан к `entry.async_on_unload(...)`, поэтому при каждой перезагрузке интеграции старый интервальный таймер остается висеть в памяти HA.
+   - *Решение*: Перед запуском фонового обновления и самой задачи проверять наличие `aiortc` (`importlib.util.find_spec("aiortc")`), не регистрировать интервал если WebRTC-бэкенд недоступен (либо пропускать `start_preview` без `aiortc`), и обязательно оборачивать `async_track_time_interval` в `entry.async_on_unload(...)`.
+2. **Зависание старого `coordinator` в Webhook при перезагрузке интеграции (`__init__.py`)**:
+   - При регистрации `webhook.async_register` ошибка `ValueError` молча подавляется (`except ValueError: pass`). После перезагрузки интеграции обработчик вебхука продолжает ссылаться на выгруженный экземпляр `coordinator`.
+   - *Решение*: Перед регистрацией вызывать `webhook.async_unregister(hass, WEBHOOK_ID)` (или динамически брать активный `coordinator` из `hass.data[DOMAIN]`) и гарантированно снимать регистрацию через `entry.async_on_unload`.
+3. **Защита от повторной регистрации Web Components (`acogo-webrtc-card.js`)**:
+   - Карточка регистрируется и через `add_extra_js_url`, и через `Lovelace resources`. Вызов `customElements.define('acogo-webrtc-card', AcoGoWebRtcCard)` не защищен проверкой `if (!customElements.get('acogo-webrtc-card'))`, что при двойной загрузке способно уронить фронтенд ошибкой `CustomElementRegistry`.
+4. **Неполные метаданные UI и сервисов (`services.yaml`, `translations/`)**:
+   - Отсутствует каталог `translations/` (`en.json`, `ru.json`), а в `services.yaml` не описаны уже зарегистрированные службы `send_order` и `switch_camera`.
+
+---
+
+### Skeptic
+Анализирую код с точки зрения SRE, безопасности, потокобезопасности и производительности Event Loop:
+
+1. **Фоновый DDoS собственной вызывной панели и утечка ресурсов (`_async_background_snapshot_refresh` и `TimerHandle`)**:
+   - Неконтролируемые таймеры `async_track_time_interval` без `async_on_unload` и без проверки `dev.get("is_online")` создают лишние пробуждения домофона по облачному API (`POST /preview/request` -> `POST /preview/end`) каждые 10 минут вхолостую, даже когда `aiortc` отсутствует или панель оффлайн.
+   - В `coordinator.py` таймеры `_preview_watchdog_handles` и `loop.call_later(ring_duration, _reset_call)` не отслеживаются как отменяемые при выгрузке интеграции и не очищаются в `async_unload_entry`.
+   *Требование*: Единый метод `coordinator.async_shutdown()`, отменяющий все активные `TimerHandle` (и превью, и сброса звонка) при выгрузке `ConfigEntry`, плюс обязательный `entry.async_on_unload` для любых подписок и интервалов.
+
+2. **Блокирующий I/O в Event Loop и гонка при 401 Re-Auth (`__init__.py`, `webrtc.py`, `api.py`)**:
+   - `setup_acogo_file_logger()` вызывается напрямую в главном потоке цикла событий (`MainThread`), выполняя синхронное открытие файла `/config/acogo.log` в `RotatingFileHandler`. Это блокирует event loop HA.
+   - В `api.py` в `_request()` при параллельных запросах с истекшим токеном все корутины по очереди заходят в `async with self._auth_lock:` и каждая повторно вызывает `await self.register_device()`, не проверяя, изменился ли уже `self.device_password`.
+   - В `switch_video()` запрос `/order/video-sw` идет с `retry_on_401=True`: согласно `technical_specification.md` (п. 2.3.4) базовые модели (Model 64) отвечают 401 на `video-sw`, что вызывает ложную перерегистрацию сессии.
+   *Требование*: Вынести `setup_acogo_file_logger` в `hass.async_add_executor_job`, проверять `if self.device_password == used_password:` внутри `_auth_lock`, и передавать `retry_on_401=False` в `switch_video()`.
+
+3. **Лишние таймауты `check_state` при звонке и для оффлайн-устройств (`api.py`, `coordinator.py`, `lock.py`, `button.py`)**:
+   - В `lock.py` и `button.py` сначала вызывается `self.coordinator.reset_call_state(self.dev_id)`, а затем `open_door_sequence`, которая снова делает `await self.check_state(target_id)` (ожидая до 3.5с при занятой шине и затем еще 3с `receiveCall`). Если звонок уже активен (`is_ringing=True`), команду замка нужно отправлять сразу, сбрасывая статус в `finally`.
+   - В `coordinator.py` в `_async_update_data` цикл по-прежнему шлет `POST /device/check-state` даже если в ответе `/device-by-app` устройство уже имеет `status == "offline"`. Также там остается мертвый код `_async_line_monitor_loop`.
+
+---
+
+### Итерация 2: Доработка Archi
+Полный консенсус со Skeptic. Консолидируем исправления по всем затронутым модулям:
+1. **`__init__.py`**:
+   - Перевести `setup_acogo_file_logger` в `await hass.async_add_executor_job(setup_acogo_file_logger)`.
+   - Чисто перерегистрировать вебхук (`async_unregister` перед `async_register`, брать актуальный `coordinator` из `hass.data[DOMAIN]`) и привязывать отмену к `entry.async_on_unload`.
+   - Проверять наличие `aiortc` перед запуском фонового обновления снимков (`find_spec("aiortc")`), проверять `is_online`, и оборачивать `async_track_time_interval` в `entry.async_on_unload(...)`.
+   - В `async_unload_entry` вызывать `coordinator.async_shutdown()`.
+2. **`api.py`**:
+   - В `_request()` запоминать `used_password = self.device_password` и внутри `_auth_lock` перерегистрировать устройство только если `self.device_password == used_password`.
+   - В `switch_video()` вызывать `_request(..., retry_on_401=False)` во избежание ложной ротации сессии на Model 64.
+   - В `open_door_sequence()` добавить параметр `is_active_call: bool | None = None`: если звонок уже подтвержден (например, через webhook), сразу отправлять `order_cmd` без задержки на `check_state` и `receiveCall`.
+3. **`coordinator.py`**:
+   - Хранить и безопасно отменять `_call_reset_handles` при повторном триггере, `reset_call_state` и выгрузке (`async_shutdown`).
+   - Пропускать лишний `check_state` в `_async_update_data`, если `dev.get("status") == "offline"`, и безопасно читать `dev.get("devId")`. Удалить мертвый код `_async_line_monitor_loop`.
+4. **`lock.py` & `button.py`**:
+   - Перед открытием читать `was_ringing = bool(self.coordinator.data.get(self.dev_id, {}).get("is_ringing", False))`, передавать в `open_door_sequence(..., is_active_call=True if was_ringing else None)` и сбрасывать `reset_call_state` в блоке `finally`.
+5. **`webrtc.py`**:
+   - Не вызывать синхронный `setup_acogo_file_logger()` повторно в event loop внутри `async_capture_webrtc_snapshot`.
+6. **`www/acogo-webrtc-card.js`, `services.yaml`, `translations/`**:
+   - Обернуть `customElements.define` в `if (!customElements.get('acogo-webrtc-card'))`.
+   - Дополнить `services.yaml` полями для `send_order` и `switch_camera`.
+   - Добавить `translations/en.json` и `translations/ru.json`.
+
+---
+
+### Skeptic (Финальное ревью)
+Все критические баги — утечка интервальных таймеров и `TimerHandle`, холостые запросы к камере при отсутствии `aiortc`, устаревшее замыкание в webhook после reload, блокирующий I/O логгера, гонка при 401 и ложная ротация в `switch_video` — полностью устранены. Архитектурный консенсус достигнут.
+
+---
+
+### Заключение
+1. Зафиксировать аудит и дебаты в `DEBATE.md`.
+2. Предложить пользователю перечень найденных проблем и консолидированные исправления для `custom_components/acogo` (плюс проинформировать о сторонних ошибках в логах сервера для `ems` и `hon`).
+3. После одобрения пользователем — применить патч к локальным файлам, развернуть на сервер HA и очистить `__pycache__`.

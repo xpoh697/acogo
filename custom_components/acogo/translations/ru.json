@@ -1,0 +1,22 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Вход в аккаунт ACO GO!",
+        "description": "Введите логин (email) и пароль от вашего аккаунта acoGO! / myAco.",
+        "data": {
+          "username": "Email / Логин",
+          "password": "Пароль"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Не удалось подключиться к облачному API ACO GO.",
+      "invalid_auth": "Неверный логин или пароль.",
+      "unknown": "Произошла непредвиденная ошибка."
+    },
+    "abort": {
+      "already_configured": "Этот аккаунт уже настроен."
+    }
+  }
+}
