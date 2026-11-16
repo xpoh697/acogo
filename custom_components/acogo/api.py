@@ -216,17 +216,17 @@ class AcoGoApiClient:
         is_gate: bool = False,
         is_active_call: bool | None = None,
     ) -> bool:
-        """Safely execute door/gate unlock with device locking and guaranteed endCall."""
+        """Safely execute door/gate unlock with fast direct send and receiveCall fallback."""
         lock = self.get_device_lock(target_id)
         order_cmd = ORDER_EZ_OPEN if is_gate else ORDER_F2_OPEN
 
         async with lock:
-            if is_active_call is None:
-                state = await self.check_state(target_id)
-                is_active_call = (state == "busy")
-
-            if is_active_call:
+            try:
                 return await self.send_order(target_id, order_cmd)
+            except AcoGoApiError as direct_err:
+                if is_active_call:
+                    raise
+                _LOGGER.debug("Direct %s failed (%s), falling back to receiveCall sequence", order_cmd, direct_err)
 
             try:
                 await self.send_order(target_id, ORDER_RECEIVE_CALL)
@@ -237,6 +237,11 @@ class AcoGoApiClient:
             finally:
                 try:
                     await self.send_order(target_id, ORDER_END_CALL)
+                except AcoGoApiError as err:
+                    if "406" in str(err):
+                        _LOGGER.debug("endCall returned 406 for %s (session already closed)", target_id)
+                    else:
+                        _LOGGER.error("Failed to send endCall for %s: %s", target_id, err)
                 except Exception as err:
                     _LOGGER.error("Failed to send endCall for %s: %s", target_id, err)
 

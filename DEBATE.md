@@ -4777,3 +4777,50 @@ profit = today_house_consumption_cost + today_export_price - today_import_price
 Утверждены два изменения (ожидают одобрения пользователя):
 1. **`custom_components/acogo/coordinator.py`**: умный автовозврат Fully Kiosk (`?cmd=toForeground`) по реальному завершению вызова через облачный `api.check_state(panel_dev_id)` == `"ready"` (2 проверки подряд с интервалом `4.5s`, минимум `20s` после открытия, ≥ `10s` без касаний экрана, safety-потолок `180s`).
 2. **`\\192.168.100.5\config\automations.yaml`**: новая автоматизация `acogo_doorbell_telegram_photo` — при `binary_sensor.ulitsa_acogo_julianow_incoming_call_line_active` (`off` → `on`) делает снимок `camera.wejscie_2` и отправляет в Telegram (`message_thread_id: 20`) с кнопками открытия двери/ворот.
+
+## [2026-11-16T13:07:12+01:00] Задача: во первых приходит картинка не с домофона. С домофота камера в интеррации через webrtc. Во вторых никакой реакции на кнопки нет в телеграм, в третиих при нажатии button.ulitsa_acogo_julianow_open_gate проходит секунд 5 от нажатия до момента начала открытия ворот
+
+### Контекст диагностики (`acogo.log`, `api.py`, `webrtc.py`, `automations.yaml`, HA logbook)
+1. **Картинка с домофона:** `camera.py` в интеграции отсутствует; видео с вызывной панели передаётся через `start_webrtc_stream` (для `acogo-webrtc-card.js`) и сервис `acogo.capture_snapshot` (`async_capture_webrtc_snapshot` в `webrtc.py`), который сейчас пропускается, т.к. `manifest.json` содержит `"requirements": []` и `aiortc` не установлен в HA (`Skipping background WebRTC snapshot refresh: 'aiortc' is not installed`).
+2. **Кнопки в Telegram:** По логам HA `automation.domofon_obrabotka_komand_iz_telegram` (`id: acogo_telegram_action_handler`) **сработала** в `12:03:29 UTC`, но в её `actions` сначала стоит блокирующий `button.press` (~9 сек из-за `DOOR_CALL_DELAY=3.0` + `DOOR_HOLD_DELAY=5.0` + `endCall`), а `telegram_bot.answer_callback_query` идёт только **после** него, когда Telegram уже просрочил callback.
+3. **Задержка 5 сек при открытии ворот:** В `api.py` (`open_door_sequence`, строки 224–236) при `is_active_call=False` выполняется `check_state` + `receiveCall` + `await asyncio.sleep(3.0)` (`DOOR_CALL_DELAY = 3.0`) до отправки `order_cmd` (`ezOpen`/`f2Open`), что даёт ~5 секунд задержки. В `13:03:38` `endCall` дополнительно упал с `API error 406 on /order?orderId=endCall`.
+
+### Archi
+Предлагаю решить все три пункта:
+1. **Фото с домофона через WebRTC:** Добавить `"aiortc>=1.9.0"` в `manifest.json` (`requirements`), чтобы HA установил `aiortc` и заработали `acogo.capture_snapshot` + фоновый кэш кадров `last_valid_snapshot`. В `automations.yaml` (`acogo_doorbell_telegram_photo`) заменить `camera.snapshot` с `camera.wejscie_2` на вызов `acogo.capture_snapshot` (`filename: /config/www/cam/doorbell_acogo.jpg`).
+2. **Мгновенный отклик кнопок в Telegram:** В `acogo_telegram_action_handler` перенести `telegram_bot.answer_callback_query` **в самое начало** (до `button.press`) и добавить подтверждающее сообщение в ветку `message_thread_id: 20`.
+3. **Ускорение открытия ворот/двери с 5 сек до < 1 сек:** В `api.py` (`open_door_sequence`) отправлять `order_cmd` (`ezOpen`/`f2Open`) **сразу напрямую** (без `check_state` и `receiveCall + 3.0s`), а если облако отклонит прямой заказ — только тогда делать fallback через `receiveCall` + короткую задержку `0.5s` и `endCall`.
+
+### Skeptic
+3 критических замечания к предложению Archi:
+1. **Риск поломки загрузки интеграции из-за `"aiortc"` в `manifest.json`:** `aiortc` тянет тяжёлые C-зависимости (`av`/FFmpeg, `cryptography`, `pylibsrtp`). Если в Docker-контейнере HA нет готовых wheel или не удастся сборка, Home Assistant не загрузит интеграцию `acogo` целиком (`RequirementsNotFound`). Поэтому при добавлении `aiortc` нужно быть готовым проверить установку при старте HA, а в автоматизации `acogo_doorbell_telegram_photo` предусмотреть: если `acogo.capture_snapshot` в момент звонка занятой линии отдаёт свежий кэш (`last_valid_snapshot`), это отлично, но если `aiortc` не сможет поставиться — иметь запасной план без поломки интеграции.
+2. **Поведение панели ACO при прямом `ezOpen`/`f2Open` без `receiveCall`:** По `technical_specification.md` (раздел 2.3.3), панель ACO может вернуть HTTP `200`, но физически не щёлкнуть реле без `receiveCall`, либо наоборот — щёлкнуть мгновенно. Нельзя просто удалить `receiveCall` без возможности проверить на реальных воротах; безопаснее сначала сократить `DOOR_CALL_DELAY` до `0.5s` или сделать прямой `send_order` с fallback, а ошибку `406 Not Acceptable` на `endCall` обрабатывать тихо (`DEBUG`), не засоряя `acogo.log` как `ERROR`.
+3. **Антифлуд и читаемость в Telegram (`acogo_telegram_action_handler`):** Вызов `telegram_bot.answer_callback_query` до `button.press` уберёт «часики» мгновенно (0.2 сек). При этом `button.press` стоит обернуть в `continue_on_error: true` или отправлять сообщение об ошибке только при реальном сбое, чтобы Telegram не оставался без обратной связи.
+
+### Итерация 2: Доработка Archi
+Принимаю все 3 пункта Skeptic:
+1. **WebRTC-снимок (`manifest.json` + `automations.yaml`):**
+   - Добавляем `"aiortc>=1.9.0"` в `manifest.json` (после деплоя сразу проверяем перезапуск HA и статус `loaded`; если `pip` не сможет поставить `aiortc`, откатим `requirements` и возьмём альтернативный путь).
+   - В `acogo_doorbell_telegram_photo` вызываем `acogo.capture_snapshot` (`filename: /config/www/cam/doorbell_acogo.jpg`, `timeout: 15`) перед отправкой в Telegram (`message_thread_id: 20`).
+2. **Telegram кнопки (`automations.yaml`, `acogo_telegram_action_handler`):**
+   - Ставим `telegram_bot.answer_callback_query` **первым действием** (до `button.press`).
+   - После `button.press` (c `continue_on_error: false`) шлём короткий статус в `message_thread_id: 20` (`✅ Дверь открыта` / `✅ Команда на открытие ворот отправлена`).
+3. **Ускорение `open_door_sequence` (`api.py` и `const.py`):**
+   - В `open_door_sequence`: если `is_active_call is True` — сразу `send_order(target_id, order_cmd)`.
+   - Если вызова нет (`is_active_call` is False/None) — пробуем сразу `send_order(target_id, order_cmd)` напрямую (0.3–0.5 сек до реле!), а при `AcoGoApiError` (если панель требует активной сессии) делаем fallback: `receiveCall` → `0.5` сек (`DOOR_CALL_DELAY = 0.5`) → `order_cmd` → `DOOR_HOLD_DELAY` → `endCall`.
+   - В `finally` при `endCall` статус `406` (`"406"` в тексте `AcoGoApiError`) не пишем как `ERROR`, а логируем как `DEBUG`.
+
+### Skeptic (Финальное ревью)
+Подтверждаю:
+- Telegram-кнопки получат мгновенный `answer_callback_query` в начале цепочки.
+- `open_door_sequence` ускоряется до ~0.5 сек с безопасным fallback на `receiveCall` и чистым логом без `ERROR 406`.
+- Установка `aiortc` проверяется сразу после перезапуска HA с готовностью к откату при проблемах сборки.
+Консенсус достигнут за 2 итерации.
+
+### Заключение
+Утверждён план изменений (ожидает одобрения пользователя):
+1. **`custom_components/acogo/manifest.json`**: добавить `"aiortc>=1.9.0"` в `requirements` для работы реального WebRTC-снимка `acogo.capture_snapshot` (проверить загрузку при рестарте HA).
+2. **`custom_components/acogo/api.py` и `const.py`**: сократить `DOOR_CALL_DELAY` до `0.5`, в `open_door_sequence` отправлять `order_cmd` сразу (с fallback на `receiveCall` при ошибке) и игнорировать `406` на `endCall`.
+3. **`\\192.168.100.5\config\automations.yaml`**:
+   - В `acogo_doorbell_telegram_photo` заменить `camera.wejscie_2` на `acogo.capture_snapshot` (`/config/www/cam/doorbell_acogo.jpg`).
+   - В `acogo_telegram_action_handler` перенести `telegram_bot.answer_callback_query` **до** `button.press`.
