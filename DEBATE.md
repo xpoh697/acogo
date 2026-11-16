@@ -4666,3 +4666,114 @@ profit = today_house_consumption_cost + today_export_price - today_import_price
 
 ### Заключение
 В `custom_components/acogo/coordinator.py` удаляются `_async_ensure_kiosk_settings()` и `self._kiosk_configured_hosts`, переводя `_async_kiosk_monitor_loop` в 100% read-only режим (`GET ?cmd=deviceInfo`). Ожидается подтверждение пользователя перед правкой кода.
+
+## [2026-11-16T12:50:56+01:00] Задача: сенсор сработал, автоматизация нет. И на планшете осталась висеть апка acogo а как бы сделать так что бы она по таймауту переходила на задний план а на верх возвращался киоск?
+
+### Контекст диагностики (`acogo.log`, `automations.yaml` и `192.168.100.19:2323`)
+- В `acogo.log` в `12:48:18` зафиксировано: `Doorbell incoming call triggered via fully_kiosk_fast for 01:01:39:b1 (acoGO! Julianów)!`, в `12:48:53` — `Call latch expired for 01:01:39:b1`.
+- В HA сработала `automation.acogo_vkhodiashchii_zvonok_s_kalitki` (`11:48:19 UTC`), сенсор `binary_sensor.ulitsa_acogo_julianow_incoming_call_line_active` перешёл в `on`, а автоматизация оповещения **`Звонок вдверь`** (`automation.zvonok_vdver`, `id: '1728566780905'`, строки 1025–1110 `automations.yaml`) **не сработала**, так как у неё в `triggers` прописан только `sensor.bell_button_action` (`to: single`).
+- В настройках Fully Kiosk на `192.168.100.19:2323` установлено `timeToRegainFocus: 0` (автовозврат фокуса отключён), а `button.taba9_bring_to_foreground` и REST-команда `?cmd=toForeground` доступны и работают.
+
+### Archi
+Решаем обе задачи комплексно и красиво:
+1. **Автоматизация оповещения:** В `automations.yaml` (`id: '1728566780905'`, `Звонок вдверь`) добавляем второй триггер:
+   ```yaml
+   - trigger: state
+     entity_id:
+     - binary_sensor.ulitsa_acogo_julianow_incoming_call_line_active
+     from: 'off'
+     to: 'on'
+   ```
+   Тогда при звонке в домофон на калитке (и по `fully_kiosk_fast`) сразу отработают Яндекс.Станции, фото с камеры в Telegram и пробуждение экрана.
+2. **Автовозврат Fully Kiosk поверх `acoGO!` по таймауту:**
+   - Вариант А: выставить `timeToRegainFocus=35` в Fully Kiosk.
+   - Вариант Б (умный): в `coordinator.py` при истечении 35-сек latch (`_reset_call` или сразу после него в `_async_kiosk_monitor_loop`) автоматически отправлять `?cmd=toForeground` на Fully Kiosk, чтобы вернуть киоск наверх.
+
+### Skeptic
+3 критических замечания к предложенному решению:
+1. **Нельзя включать глобальный `timeToRegainFocus` в Fully Kiosk:** Если поставить `timeToRegainFocus=35`, то при ручном сворачивании киоска пользователем (например, в настройки Android) киоск через 35 секунд насильно перекроет экран и выбьет пользователя! Возвращать фокус нужно **только** если поверх киоска висит именно `pl.aco.acogo`.
+2. **Обрыв активного разговора, если возвращать фокус ровно по 35-секундному таймеру без проверки состояния, или слишком ранний возврат:** Если пользователь реально разговаривает через `acoGO!`, или если в `tablet-dashboard-card.js` камера показывается `doorbell_camera_duration` (обычно 30–45 сек), возврат киоска в `toForeground` должен быть неблокирующим (с коротким таймаутом `1.5s`), срабатывать строго по таймауту звонка (`CALL_RETURN_FOCUS_DELAY`, например `40` сек или при истечении `ring_duration` `35` сек) и **только** если `self._kiosk_prev_apps.get(host) == "pl.aco.acogo"`.
+3. **Задержка `camera.snapshot` и лишняя нагрузка в `automation.zvonok_vdver`:** В `automation.zvonok_vdver` используется `camera.wejscie_2` (внешняя камера над входом, которая не зависит от `acoGO!` превью). Но `from: 'off'` в триггере `binary_sensor.ulitsa_acogo_julianow_incoming_call_line_active` важно указать явно, чтобы восстановление из `unavailable` после рестарта HA не слало ложный звонок с фото в Telegram!
+
+### Итерация 2: Доработка Archi
+Принимаю все 3 замечания Skeptic:
+1. `timeToRegainFocus` в Fully Kiosk оставляем `0`, чтобы при ручном сворачивании киоска он никогда не мешал пользователю.
+2. В `coordinator.py`:
+   - В `async_handle_call_trigger()` (при истечении `ring_duration = 35.0` сек в `_reset_call`) запускаем фоновую задачу `self.hass.async_create_task(self._async_return_kiosk_foreground())`.
+   - `_async_return_kiosk_foreground()` проверяет `for k_entry in self.hass.config_entries.async_entries("fully_kiosk"):` и отправляет `GET {scheme}://{host}:2323/?cmd=toForeground&type=json&password=...` (таймаут `1.5` сек) **только если `self._kiosk_prev_apps.get(host) == "pl.aco.acogo"`**.
+   - Кроме того, сразу при появлении `pl.aco.acogo` можно не трогать фокус, давая `acoGO!` или звонку 35 сек, а через 35 сек киоск мягко возвращается на передний план (поверх `acoGO!`), где `tablet-dashboard-card.js` уже открыл камеру/дашборд.
+3. В `automations.yaml` (`id: '1728566780905'`, `Звонок вдверь`) добавляем триггер:
+   ```yaml
+   - entity_id:
+     - binary_sensor.ulitsa_acogo_julianow_incoming_call_line_active
+     from: 'off'
+     to: 'on'
+     trigger: state
+   ```
+   (строго `from: 'off'`, чтобы исключить ложные срабатывания при `unavailable -> on`).
+
+### Skeptic (Финальное ревью)
+Подтверждаю:
+- Ручное сворачивание киоска остаётся полностью свободным (`timeToRegainFocus = 0`).
+- Автовозврат киоска работает адресно — только при активном `pl.aco.acogo` по истечении 35-секундного таймаута вызова, с таймаутом HTTP `1.5s`.
+- Автоматизация `Звонок вдверь` защищена условием `from: 'off'` → `to: 'on'`.
+Консенсус достигнут за 2 итерации.
+
+### Заключение
+Утверждено решение из двух частей (ожидает подтверждения пользователя):
+1. **`\\192.168.100.5\config\automations.yaml` (`id: '1728566780905'`, `Звонок вдверь`)**: добавить триггер `binary_sensor.ulitsa_acogo_julianow_incoming_call_line_active` (`from: 'off'`, `to: 'on'`).
+2. **`custom_components/acogo/coordinator.py`**: добавить метод `_async_return_kiosk_foreground()`, который по истечении 35-секундного таймера звонка (`_reset_call`) возвращает Fully Kiosk на передний план (`?cmd=toForeground`), **только если** в этот момент на планшете всё ещё открыт `pl.aco.acogo`.
+
+## [2026-11-16T12:55:40+01:00] Задача: мало 35 секунд может свернуться в процессе разговора, есть способ детекции когда вызов уже не идет? Автоматизацию не трогаем вместо этого пишем новую что при вызове шлется сообщение с фото с домофон в телекгам в ветку с камерами о звонке в домофон
+
+### Контекст из ТЗ (`technical_specification.md`) и конфигурации HA
+- Согласно `technical_specification.md` (раздел 2.3.2), облачный метод `POST /device/check-state` (`self.api.check_state(dev_id)`) возвращает `"busy"`, пока идёт вызов или активный разговор, и `"ready"`, когда вызов завершён и линия свободна.
+- В `automations.yaml`: существующую автоматизацию `Звонок вдверь` (`id: '1728566780905'`) не трогаем. Ветка камер в Telegram — `message_thread_id: 20` (используется во всех фото-уведомлениях с камер). В `automations.yaml` (строки 6341–6390) уже настроен обработчик `acogo_telegram_action_handler` на inline-кнопки `/aco_open_door` и `/aco_open_gate`.
+- На сервере HA `aiortc` не установлен (`Skipping background WebRTC snapshot refresh: 'aiortc' is not installed`), а живая внешняя камера входа — `camera.wejscie_2`.
+
+### Archi
+Предлагаю решить обе задачи чисто:
+1. **Детекция окончания вызова и возврат киоска в `coordinator.py`:**
+   - Вместо жёсткого таймера 35 секунд отслеживаем, сколько времени `curr_app == "pl.aco.acogo"` висит поверх киоска.
+   - Как только `acoGO!` открыт дольше 15 секунд, раз в `4.5` сек в `_async_kiosk_monitor_loop` опрашиваем `await self.api.check_state(panel_dev_id)`.
+   - Пока панель отвечает `"busy"` (идёт звонок или разговор), киоск **не трогает** экран. Как только `check_state` возвращает `"ready"` (вызов/разговор завершён), вызываем `?cmd=toForeground` на Fully Kiosk — и киоск возвращается на передний план!
+2. **Новая отдельная автоматизация в `automations.yaml`:**
+   - Триггер: `binary_sensor.ulitsa_acogo_julianow_incoming_call_line_active` (`from: 'off'`, `to: 'on'`).
+   - Действия: включить экран планшета (`switch.taba9_screen`), сделать снимок с `camera.wejscie_2` в `/config/www/cam/doorbell_acogo.jpg` и отправить его через `telegram_bot.send_photo` в `message_thread_id: 20` с подписью `🔔 Входящий звонок в домофон (калитка)` и inline-кнопками `🚪 Открыть дверь:/aco_open_door`, `🚗 Открыть ворота:/aco_open_gate`.
+
+### Skeptic
+3 критических замечания к решению Archi:
+1. **Защита от преждевременного сворачивания, если панель отдает `"ready"` в первые секунды push-вызова или при ручном открытии `acoGO!`:** Бывает, что пользователь сам открыл `acoGO!` или push на планшет пришёл за 1–2 сек до/после смены статуса облака, либо пользователь продолжает нажимать кнопки в `acoGO!` уже после завершения разговора. Нужны три предохранителя:
+   - Не возвращать киоск, если с момента появления `pl.aco.acogo` прошло меньше `20` секунд ИЛИ если с последнего касания экрана (`timestamp - lastUserInteractionTime`) прошло меньше `10` секунд.
+   - Требовать подтверждения `"ready"` (2 последовательных проверки `"ready"` или `check_state == "ready"` после окончания вызова), а также сбрасывать состояние звонка `reset_call_state(panel_dev_id)` в этот же момент.
+   - Иметь страхующий потолок (например, `180` сек) на случай зависания облака или оставленного открытым окна `acoGO!`.
+2. **Ограничение частоты облачных запросов `check_state` и таймаут:** Нельзя вызывать `self.api.check_state(panel_dev_id)` каждые 1.5 сек в основном цикле, чтобы не спамить облако ACO. Опрос `check_state` при активном `pl.aco.acogo` делать не чаще раза в `4.5` сек, с обработкой исключений (при ошибке сети считать линию ещё занятой и не сворачивать разговор!).
+3. **Задержка записи файла снимка перед `telegram_bot.send_photo`:** После `camera.snapshot` нужно выдержать паузу `1` секунду (как в других автоматизациях этого же проекта), чтобы файл `/config/www/cam/doorbell_acogo.jpg` гарантированно дописался на диск до отправки в Telegram, и поставить `mode: single` с `max_exceeded: silent` для защиты от дублей.
+
+### Итерация 2: Доработка Archi
+Принимаю все 3 пункта Skeptic:
+1. В `coordinator.py`:
+   - Ведём словарь `self._kiosk_acogo_since: dict[str, float]` (время появления `pl.aco.acogo`), `self._kiosk_last_state_check: dict[str, float]` (интервал `4.5` сек между вызовами `check_state`), `self._kiosk_ready_streak: dict[str, int]` (счётчик подряд ответов `"ready"`).
+   - Возвращаем киоск (`?cmd=toForeground` с таймаутом `1.5s`) только если `curr_app == "pl.aco.acogo"` И:
+     - `elapsed >= 20.0` сек с момента открытия `acoGO!`;
+     - `ts - last_touch > 10000` мс (пользователь не взаимодействует с экраном прямо сейчас);
+     - `check_state(panel_dev_id)` вернул `"ready"` **2 раза подряд** (или `elapsed >= 180.0` сек как safety-таймаут).
+   - При ошибке `check_state` счётчик `ready_streak` сбрасывается в `0` — разговор никогда не оборвётся из-за сбоя сети!
+   - При уходе с `pl.aco.acogo` эти счётчики очищаются, а при возврате киоска вызывается `reset_call_state(panel_dev_id)`.
+2. В `automations.yaml`:
+   - Добавляем новую отдельную автоматизацию `id: acogo_doorbell_telegram_photo` (`alias: 'Домофон: Фото в Telegram при входящем вызове'`), `mode: single`:
+     - Триггер: `binary_sensor.ulitsa_acogo_julianow_incoming_call_line_active` (`from: 'off'`, `to: 'on'`).
+     - Действия: `camera.snapshot` (`camera.wejscie_2` → `/config/www/cam/doorbell_acogo.jpg`), `delay: seconds: 1`, `telegram_bot.send_photo` в `message_thread_id: 20` с кнопками `/aco_open_door` и `/aco_open_gate`.
+   - Существующую `Звонок вдверь` (`1728566780905`) не изменяем.
+
+### Skeptic (Финальное ревью)
+Подтверждаю:
+- Во время живого разговора (`check_state == "busy"` или при нажатиях на экран) `acoGO!` не свернётся.
+- После завершения вызова (`"ready"` подтверждён 2 раза подряд + прошло ≥ 20 сек + ≥ 10 сек без касаний) киоск автоматически возвращается на передний план.
+- Новая автоматизация изолирована, не затрагивает `Звонок вдверь`, защищена `from: 'off'`, `delay: 1s` и `mode: single`.
+Консенсус достигнут за 2 итерации.
+
+### Заключение
+Утверждены два изменения (ожидают одобрения пользователя):
+1. **`custom_components/acogo/coordinator.py`**: умный автовозврат Fully Kiosk (`?cmd=toForeground`) по реальному завершению вызова через облачный `api.check_state(panel_dev_id)` == `"ready"` (2 проверки подряд с интервалом `4.5s`, минимум `20s` после открытия, ≥ `10s` без касаний экрана, safety-потолок `180s`).
+2. **`\\192.168.100.5\config\automations.yaml`**: новая автоматизация `acogo_doorbell_telegram_photo` — при `binary_sensor.ulitsa_acogo_julianow_incoming_call_line_active` (`off` → `on`) делает снимок `camera.wejscie_2` и отправляет в Telegram (`message_thread_id: 20`) с кнопками открытия двери/ворот.

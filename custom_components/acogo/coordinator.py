@@ -45,6 +45,9 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._kiosk_monitor_task: asyncio.Task[None] | None = None
         self._kiosk_prev_apps: dict[str, str] = {}
         self._kiosk_usage_warned: bool = False
+        self._kiosk_acogo_since: dict[str, float] = {}
+        self._kiosk_last_state_check: dict[str, float] = {}
+        self._kiosk_ready_streak: dict[str, int] = {}
         # Cache for last valid real camera frame (device_id -> (timestamp, jpeg_bytes))
         self.last_valid_snapshot: dict[str, tuple[float, bytes]] = {}
 
@@ -55,6 +58,75 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._async_kiosk_monitor_loop(),
                 "acogo_fully_kiosk_monitor",
             )
+
+    def _get_intercom_device_id(self) -> str | None:
+        """Return the main intercom panel device_id (excluding mobile app clients)."""
+        data = self.data or {}
+        for dev_id, dev_data in data.items():
+            if dev_data.get("info", {}).get("model") not in APP_MODELS:
+                return dev_id
+        return next(iter(data), None)
+
+    async def _async_check_and_return_kiosk(
+        self,
+        session: aiohttp.ClientSession,
+        host: str,
+        url: str,
+        password: str,
+        timeout: aiohttp.ClientTimeout,
+        verify_ssl: bool,
+        info: dict[str, Any],
+    ) -> None:
+        """Return Fully Kiosk to foreground once the intercom call/talk has actually ended."""
+        now_mono = asyncio.get_running_loop().time()
+        since = self._kiosk_acogo_since.setdefault(host, now_mono)
+        elapsed = now_mono - since
+        if elapsed < 20.0:
+            return
+
+        ts = int(info.get("timestamp") or 0)
+        last_touch = int(info.get("lastUserInteractionTime") or 0)
+        if ts and last_touch and (ts - last_touch) < 10000 and elapsed < 180.0:
+            return
+
+        last_check = self._kiosk_last_state_check.get(host, 0.0)
+        if now_mono - last_check < 4.5 and elapsed < 180.0:
+            return
+        self._kiosk_last_state_check[host] = now_mono
+
+        panel_dev_id = self._get_intercom_device_id()
+        should_return = elapsed >= 180.0
+        if not should_return and panel_dev_id:
+            try:
+                line_state = await self.api.check_state(panel_dev_id)
+                if line_state == "ready":
+                    self._kiosk_ready_streak[host] = self._kiosk_ready_streak.get(host, 0) + 1
+                    if self._kiosk_ready_streak[host] >= 2:
+                        should_return = True
+                else:
+                    self._kiosk_ready_streak[host] = 0
+            except Exception:
+                self._kiosk_ready_streak[host] = 0
+
+        if not should_return:
+            return
+
+        params = {"cmd": "toForeground", "type": "json", "password": password}
+        try:
+            async with session.get(url, params=params, timeout=timeout, ssl=verify_ssl) as resp:
+                _LOGGER.info(
+                    "Returned Fully Kiosk (%s) to foreground after call ended (elapsed=%.1fs, HTTP %s)",
+                    host,
+                    elapsed,
+                    resp.status,
+                )
+            if panel_dev_id:
+                self.reset_call_state(panel_dev_id)
+            self._kiosk_acogo_since.pop(host, None)
+            self._kiosk_last_state_check.pop(host, None)
+            self._kiosk_ready_streak.pop(host, None)
+        except (aiohttp.ClientError, TimeoutError) as err:
+            _LOGGER.debug("Failed to return Fully Kiosk (%s) to foreground: %s", host, err)
 
     async def _async_kiosk_monitor_loop(self) -> None:
         """Poll Fully Kiosk deviceInfo every 1.5s for exact pl.aco.acogo call detection."""
@@ -94,8 +166,18 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self._kiosk_prev_apps[host] = curr_app
 
                     if prev_app != "pl.aco.acogo" and curr_app == "pl.aco.acogo":
+                        self._kiosk_acogo_since[host] = asyncio.get_running_loop().time()
+                        self._kiosk_last_state_check.pop(host, None)
+                        self._kiosk_ready_streak.pop(host, None)
                         await self.async_handle_call_trigger(source="fully_kiosk_fast")
+                    elif curr_app == "pl.aco.acogo":
+                        await self._async_check_and_return_kiosk(
+                            session, host, url, password, timeout, verify_ssl, info
+                        )
                     elif prev_app == "pl.aco.acogo" and curr_app != "pl.aco.acogo":
+                        self._kiosk_acogo_since.pop(host, None)
+                        self._kiosk_last_state_check.pop(host, None)
+                        self._kiosk_ready_streak.pop(host, None)
                         for dev_id in list(self._call_reset_handles):
                             self.reset_call_state(dev_id)
                     elif (
