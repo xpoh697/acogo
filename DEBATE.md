@@ -4824,3 +4824,65 @@ profit = today_house_consumption_cost + today_export_price - today_import_price
 3. **`\\192.168.100.5\config\automations.yaml`**:
    - В `acogo_doorbell_telegram_photo` заменить `camera.wejscie_2` на `acogo.capture_snapshot` (`/config/www/cam/doorbell_acogo.jpg`).
    - В `acogo_telegram_action_handler` перенести `telegram_bot.answer_callback_query` **до** `button.press`.
+
+## [2026-11-16T13:22:01+01:00] Задача: позвонил 2 раза. первый меня не было перед камерой домофона, второй был. Оба раза пришло изображение где перед камерой никого нет. Кнопки нихрена не работают, в какой-то момент при тыкании кнопки октрыть дверь удалось открыть ворота (перепутаны сущности?) (при этом ребенок дома поднял трубку домофона). Кнопки должны срабатывать вне зависимости от того снята трубка или нет
+
+### Контекст диагностики (`acogo.log` и `technical_specification.md`)
+1. **Изображение с пустым двором при обоих звонках (`13:18:00` и `13:18:43`):**
+   - `2026-11-16 13:18:00 [DEBUG] Could not obtain active preview AWS parameters for 01:01:39:b1 (intercom busy in call)`
+   - `2026-11-16 13:18:00 [INFO] Using cached real camera snapshot from 310 ago`
+   - Пока идёт звонок на панели ACO GO (model 64), видеоканал занят самим вызовом, облако отклоняет `/preview/request` с `"busy"`, и `acogo.capture_snapshot` отдаёт старый кэш (от 13:12:50, когда перед дверью никого не было).
+2. **Перепутаны дверь и ворота (`api.py` строка 221):**
+   - В `api.py` было `order_cmd = ORDER_EZ_OPEN if is_gate else ORDER_F2_OPEN`, хотя по `technical_specification.md` (раздел 2.3.3): `ezOpen` — дверь 1 (основной электрозамок), а `f2Open` — ворота / замок 2 (F2). Поэтому кнопка `open_door` открывала ворота!
+3. **Кнопки не срабатывали, пока ребёнок не снял трубку:**
+   - Облако ACO принимает прямой `ezOpen`/`f2Open` со статусом HTTP `200 OK` (не бросая `AcoGoApiError`), но сама панель домофона **не срабатывает физически без активного вызова (`receiveCall` или снятой трубки)**! Поэтому наш обход через `except AcoGoApiError` не доходил до `receiveCall`.
+
+### Archi
+Предлагаю исправить все три проблемы сразу:
+1. **Исправить маппинг команд в `api.py`:** `order_cmd = ORDER_F2_OPEN if is_gate else ORDER_EZ_OPEN` (`open_door` → `ezOpen`, `open_gate` → `f2Open`).
+2. **Надёжное срабатывание кнопок вне зависимости от трубки в `api.py`:**
+   - В `open_door_sequence` проверять `state = await self.check_state(target_id)` (если `is_active_call is None`):
+     - если `state == "busy"` (звонок активен / трубка снята) → отправлять `order_cmd` мгновенно напрямую;
+     - если `state != "busy"` (вызова нет) → выполнять `receiveCall` → пауза `1.0` сек (`DOOR_CALL_DELAY = 1.0`, быстрее чем старые `3.0` сек) → `order_cmd` → `DOOR_HOLD_DELAY` → `endCall` (с подавлением `406`).
+3. **Актуальное фото в момент звонка (`automations.yaml`):**
+   - Так как во время активного звонка облачный WebRTC `/preview/request` занят самим вызовом (`busy`), в `acogo_doorbell_telegram_photo` лучше всего брать **свежий живой кадр** с `camera.wejscie_2` (либо, если `pl.aco.acogo` на планшете уже открыл видеопоток домофона — скриншот планшета? Нет, на скриншоте планшета может быть заставка или анимация запуска `acoGO!`). Надёжнее: вызывать `camera.snapshot` с `camera.wejscie_2` (живая картинка *прямо сейчас* в момент звонка, а не 5-минутный кэш!).
+
+### Skeptic
+3 критических замечания к решению Archi:
+1. **Почему нельзя полагаться только на `DOOR_CALL_DELAY = 0.5s` (нужно `1.0–1.5s`) и почему `was_ringing` в `button.py` иногда вводит в заблуждение:**
+   - Посмотрите на лог `13:18:09` и `13:18:51` (`Call state reset for 01:01:39:b1`), а до этого `was_ringing` мог быть `True` только от `fully_kiosk_fast`, даже если реальная панель уже перешла в `ready`! В `button.py` (`async_press`) не стоит передавать `is_active_call=True` вслепую только из `is_ringing` — лучше в `open_door_sequence` проверять реальный `check_state(self.dev_id)` (или если `was_ringing` и `check_state == "busy"` → сразу `order_cmd`, иначе `receiveCall` → `1.0s` → `order_cmd`!). Это гарантирует 100% срабатывание и со снятой трубкой, и без неё.
+2. **Почему пользователь просит фото именно с домофона, а не с `camera.wejscie_2`, и как его получить во время звонка:**
+   - Во время звонка **единственное** место, где есть живое видео с камеры самого домофона — это открывшееся на планшете приложение `pl.aco.acogo` (`http://192.168.100.19:2323/?cmd=getScreenshot&password=admin` через 2.5–3 сек после старта звонка, когда видеопоток на планшете уже прогрузился), либо `camera.wejscie_2` как мгновенное фото входа.
+   - Но в HA `acogo.capture_snapshot` сейчас отдаёт **5-минутный старый кэш** при `busy`, что обманывает пользователя (приходит старое пустое фото!). Значит `acogo.capture_snapshot` без параметра или в момент звонка на `busy` **нельзя** использовать как "свежее фото звонящего". Либо снимаем скриншот с экрана планшета (`taba9`) через 3 сек после триггера (пока `acoGO!` открыт на видео), либо используем `camera.wejscie_2`. Лучший вариант: в `acogo_doorbell_telegram_photo` сделать `delay: 3s` (или сразу `camera.wejscie_2`, а если `taba9` на `pl.aco.acogo` — `getScreenshot` через HA `downloader`/`rest` или `camera.taba9`!).
+   - Стоп: `camera.taba9` **уже есть** в Home Assistant (`CAM: camera.taba9 state= idle name= TabA9` мы видели в списке камер!!)! `camera.snapshot` на `camera.taba9` через 3 сек после звонка отдаёт скриншот окна `acoGO!` с видео с домофона — ИЛИ `camera.wejscie_2` даёт чёткое уличное фото входа без интерфейса! Нужно предложить это явно пользователю, а не подсовывать 5-минутный кэш!
+3. **Убрать лишнюю `DOOR_HOLD_DELAY = 5.0` после `order_cmd` в `api.py` (или сократить до `2.0s`):**
+   - После отправки `ezOpen`/`f2Open` `button.press` в HA держит блокировку ещё 5 секунд перед `endCall`. Для Telegram-кнопок (так как `answer_callback_query` теперь идёт до `button.press`) это не блокирует «часики», но сократить `DOOR_HOLD_DELAY` до `2.0s` (или делать `endCall` в фоне через `2.0s`) сделает повторные нажатия ворот/двери намного отзывчивее.
+
+### Итерация 2: Доработка Archi
+Принимаю все 3 пункта Skeptic:
+1. **`api.py` и `const.py`:**
+   - Исправляем перепутанные команды: `order_cmd = ORDER_F2_OPEN if is_gate else ORDER_EZ_OPEN` (`open_door` → `ezOpen`, `open_gate` → `f2Open`).
+   - В `button.py` (`async_press`): убираем `is_active_call=True if was_ringing else None`, передаём `is_active_call=None`, чтобы `open_door_sequence` всегда опирался на реальный `check_state(target_id)`!
+   - В `open_door_sequence`:
+     - Если `state == "busy"` (идёт вызов или снята трубка) → сразу `await self.send_order(target_id, order_cmd)` (~0.3 сек).
+     - Если `state != "busy"` (вызова нет / трубка не снята) → `receiveCall` → `DOOR_CALL_DELAY = 1.0` сек → `order_cmd` → `DOOR_HOLD_DELAY = 2.0` сек → `endCall` (с тихим `DEBUG` на `406`).
+2. **Фото в момент звонка (`automations.yaml`):**
+   - Больше **не** используем `acogo.capture_snapshot` во время звонка (он отдаёт 5-минутный кэш из-за того, что панель занята вызовом `busy`).
+   - Вариант 1 (с самой камеры домофона во время звонка): подождать `3` секунды (чтобы на планшете `acoGO!` успел поднять видеопоток с калитки) и сделать `camera.snapshot` с `camera.taba9` (скриншот планшета с окном видеодомофона) — либо, если планшет не в `pl.aco.acogo`, с `camera.wejscie_2`.
+   - Вариант 2 (мгновенно 0 сек): `camera.wejscie_2` (живая камера входа).
+   - Предлагаем пользователю оба варианта в Phase 3 и реализуем с `camera.taba9` (при активном `acoGO!` после `delay: 3s`) + fallback/параллельно `camera.wejscie_2` по его выбору!
+
+### Skeptic (Финальное ревью)
+Подтверждаю:
+- Перепутанные `ezOpen`/`f2Open` исправляются (`open_door` → `ezOpen`, `open_gate` → `f2Open`).
+- Открытие работает гарантированно и при снятой трубке (`busy` → мгновенно ~0.3s), и при положенной трубке (`receiveCall` → `1.0s` → `order_cmd`).
+- Устранён баг со старым 5-минутным кэшем фото при звонке.
+Консенсус достигнут за 2 итерации.
+
+### Заключение
+Утверждён план исправлений (ожидает одобрения пользователя):
+1. **`custom_components/acogo/api.py`, `const.py`, `button.py`**:
+   - Исправить `order_cmd = ORDER_F2_OPEN if is_gate else ORDER_EZ_OPEN`.
+   - Проверять реальный `check_state()` в `open_door_sequence`: при `busy` — мгновенный `send_order`, иначе `receiveCall` → `1.0s` → `order_cmd` → `2.0s` → `endCall`.
+2. **`\\192.168.100.5\config\automations.yaml` (`acogo_doorbell_telegram_photo`)**:
+   - Отказаться от `acogo.capture_snapshot` в момент звонка (из-за занятости канала панели и отдачи старого кэша) и брать актуальное фото в момент звонка (скриншот `camera.taba9` через 3 сек, пока `acoGO!` показывает звонящего, и/или живой кадр `camera.wejscie_2`).
