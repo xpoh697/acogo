@@ -255,6 +255,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     coordinator = AcoGoDataUpdateCoordinator(hass, api)
     await coordinator.async_config_entry_first_refresh()
+    coordinator.start_kiosk_monitor()
 
     hass.data[DOMAIN][entry.entry_id] = {
         "api": api,
@@ -277,14 +278,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     coordinator.async_handle_call_trigger(source=entity_id)
                 )
         elif entity_id.endswith("_foreground_app"):
-            if (
-                old_state is not None
-                and old_state.state not in ("unknown", "unavailable", "pl.aco.acogo")
-                and new_state.state == "pl.aco.acogo"
-            ):
-                hass.async_create_task(
-                    coordinator.async_handle_call_trigger(source=entity_id)
-                )
+            if old_state is not None:
+                if (
+                    old_state.state not in ("unknown", "unavailable", "pl.aco.acogo")
+                    and new_state.state == "pl.aco.acogo"
+                ):
+                    hass.async_create_task(
+                        coordinator.async_handle_call_trigger(source=entity_id)
+                    )
+                elif (
+                    old_state.state == "pl.aco.acogo"
+                    and new_state.state != "pl.aco.acogo"
+                ):
+                    for active_dev_id in list(coordinator._call_reset_handles):
+                        coordinator.reset_call_state(active_dev_id)
 
     entry.async_on_unload(
         hass.bus.async_listen(EVENT_STATE_CHANGED, _async_on_tablet_state_changed)

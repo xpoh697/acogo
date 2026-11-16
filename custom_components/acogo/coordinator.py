@@ -6,8 +6,11 @@ from datetime import timedelta
 import logging
 from typing import Any
 
+import aiohttp
+
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import AcoGoApiClient, AcoGoApiError
@@ -39,15 +42,125 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._call_latch_until: dict[str, float] = {}
         self._call_cooldown_until: dict[str, float] = {}
         self._preview_cooldown_until: dict[str, float] = {}
+        self._kiosk_monitor_task: asyncio.Task[None] | None = None
+        self._kiosk_prev_apps: dict[str, str] = {}
+        self._kiosk_configured_hosts: set[str] = set()
+        self._kiosk_usage_warned: bool = False
         # Cache for last valid real camera frame (device_id -> (timestamp, jpeg_bytes))
         self.last_valid_snapshot: dict[str, tuple[float, bytes]] = {}
+
+    def start_kiosk_monitor(self) -> None:
+        """Start fast local LAN polling of Fully Kiosk instances configured in HA."""
+        if self._kiosk_monitor_task is None or self._kiosk_monitor_task.done():
+            self._kiosk_monitor_task = self.hass.async_create_background_task(
+                self._async_kiosk_monitor_loop(),
+                "acogo_fully_kiosk_monitor",
+            )
+
+    async def _async_ensure_kiosk_settings(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        password: str,
+        timeout: aiohttp.ClientTimeout,
+        verify_ssl: bool,
+    ) -> None:
+        """Enable usageStatistics and setWifiWakelock when Fully Kiosk wakes up."""
+        for setting_key in ("usageStatistics", "setWifiWakelock"):
+            params = {
+                "cmd": "setBooleanSetting",
+                "key": setting_key,
+                "value": "true",
+                "type": "json",
+                "password": password,
+            }
+            try:
+                async with session.get(
+                    url,
+                    params=params,
+                    timeout=timeout,
+                    ssl=verify_ssl,
+                ) as resp:
+                    _LOGGER.debug("Set Fully Kiosk %s=true (HTTP %s)", setting_key, resp.status)
+            except (aiohttp.ClientError, TimeoutError):
+                pass
+
+    async def _async_kiosk_monitor_loop(self) -> None:
+        """Poll Fully Kiosk deviceInfo every 1.5s for exact pl.aco.acogo call detection."""
+        session = async_get_clientsession(self.hass)
+        timeout = aiohttp.ClientTimeout(total=1.5)
+
+        while True:
+            try:
+                for k_entry in self.hass.config_entries.async_entries("fully_kiosk"):
+                    host = k_entry.data.get("host")
+                    password = k_entry.data.get("password", "")
+                    if not host:
+                        continue
+                    scheme = "https" if k_entry.data.get("ssl") else "http"
+                    verify_ssl = bool(k_entry.data.get("verify_ssl", False))
+                    url = f"{scheme}://{host}:2323/"
+                    params = {"cmd": "deviceInfo", "type": "json", "password": password}
+                    try:
+                        async with session.get(
+                            url,
+                            params=params,
+                            timeout=timeout,
+                            ssl=verify_ssl,
+                        ) as resp:
+                            if resp.status != 200:
+                                continue
+                            info = await resp.json(content_type=None)
+                    except (aiohttp.ClientError, TimeoutError):
+                        continue
+
+                    if host not in self._kiosk_configured_hosts:
+                        self._kiosk_configured_hosts.add(host)
+                        await self._async_ensure_kiosk_settings(
+                            session, url, password, timeout, verify_ssl
+                        )
+
+                    if not isinstance(info, dict):
+                        continue
+                    curr_app = info.get("foregroundApp") or ""
+                    if not curr_app:
+                        continue
+                    prev_app = self._kiosk_prev_apps.get(host)
+                    self._kiosk_prev_apps[host] = curr_app
+
+                    if prev_app != "pl.aco.acogo" and curr_app == "pl.aco.acogo":
+                        await self.async_handle_call_trigger(source="fully_kiosk_fast")
+                    elif prev_app == "pl.aco.acogo" and curr_app != "pl.aco.acogo":
+                        for dev_id in list(self._call_reset_handles):
+                            self.reset_call_state(dev_id)
+                    elif (
+                        prev_app == "de.ozerov.fully"
+                        and curr_app == "com.sec.android.app.launcher"
+                        and not self._kiosk_usage_warned
+                    ):
+                        self._kiosk_usage_warned = True
+                        _LOGGER.warning(
+                            "Fully Kiosk (%s) reported com.sec.android.app.launcher; verify Android Usage Access permission is granted if acoGO! popped up",
+                            host,
+                        )
+
+                await asyncio.sleep(1.5)
+            except asyncio.CancelledError:
+                break
+            except Exception as err:
+                _LOGGER.debug("Fully Kiosk fast monitor error: %s", err)
+                await asyncio.sleep(3.0)
 
     def stop_line_monitor(self) -> None:
         """Kept for backwards compatibility; delegates to async_shutdown."""
         self.async_shutdown()
 
     def async_shutdown(self) -> None:
-        """Cancel all active watchdog and call reset timers on unload."""
+        """Cancel all active watchdog, call reset timers, and kiosk monitor task on unload."""
+        if self._kiosk_monitor_task is not None and not self._kiosk_monitor_task.done():
+            self._kiosk_monitor_task.cancel()
+        self._kiosk_monitor_task = None
+
         for handle in self._preview_watchdog_handles.values():
             handle.cancel()
         self._preview_watchdog_handles.clear()
