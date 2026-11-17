@@ -4886,3 +4886,59 @@ profit = today_house_consumption_cost + today_export_price - today_import_price
    - Проверять реальный `check_state()` в `open_door_sequence`: при `busy` — мгновенный `send_order`, иначе `receiveCall` → `1.0s` → `order_cmd` → `2.0s` → `endCall`.
 2. **`\\192.168.100.5\config\automations.yaml` (`acogo_doorbell_telegram_photo`)**:
    - Отказаться от `acogo.capture_snapshot` в момент звонка (из-за занятости канала панели и отдачи старого кэша) и брать актуальное фото в момент звонка (скриншот `camera.taba9` через 3 сек, пока `acoGO!` показывает звонящего, и/или живой кадр `camera.wejscie_2`).
+
+## [2026-11-17T09:36:16+01:00] Задача: позвонил не сработала автоматизация
+
+### Контекст диагностики (`acogo.log`, история HA, тест `camera.taba9`)
+- В `09:32:46` `fully_kiosk_fast` сработал штатно, `binary_sensor.ulitsa_acogo_julianow_incoming_call_line_active` перешёл в `on`, и `automation.domofon_foto_v_telegram_pri_vkhodiashchem_vyzove` **запустилась** (`last_triggered: 2026-11-17T08:32:46.564972+00:00`).
+- Выполнение прервалось на действии `camera.snapshot` с `camera.taba9` — прямой тест `POST /api/services/camera/snapshot` (`entity_id: camera.taba9`) вернул ошибку `HTTP 500: ('Error', 'No camshot available')`. В интеграции `fully_kiosk` сущность `camera.taba9` отвечает за фронтальную камеру планшета (`getCamshot`), а не за скриншот экрана (`getScreenshot`).
+
+### Archi
+В `automations.yaml` (`acogo_doorbell_telegram_photo`) убираем `camera.snapshot` на `camera.taba9` и передаём в `telegram_bot.send_photo` напрямую `url: http://192.168.100.19:2323/?cmd=getScreenshot&password=admin` после `delay: seconds: 3`!
+
+### Skeptic
+3 замечания:
+1. **Если Fully Kiosk без системного разрешения на захват экрана или `getScreenshot` вернёт ошибку, автоматизация снова прервётся молча без уведомления о звонке:** Нужно добавить `continue_on_error: true` на отправку фото и fallback — если фото не отправилось, хотя бы текстовое `telegram_bot.send_message` с кнопками `/aco_open_door` и `/aco_open_gate` в `message_thread_id: 20` (или запасной кадр `camera.wejscie_2` только если скриншот упал).
+2. **Убрать `authentication: digest` при передаче `url` без авторизации Digest:** У Fully Kiosk пароль передаётся в query-параметре `password=admin`, а не через HTTP Digest Auth — флаг `authentication: digest` нужно убрать, чтобы `telegram_bot` не путался при загрузке URL.
+3. **Защита `mode: single` + короткий `delay: 3s`:** Сохранить `mode: single` и `max_exceeded: silent`, чтобы при повторных нажатиях вызывной панели не слались дубли.
+
+### Итерация 2: Доработка Archi
+Принимаю все 3 пункта Skeptic:
+- В `acogo_doorbell_telegram_photo`:
+  1. `switch.turn_on` (`switch.taba9_screen`) + `delay: seconds: 3`.
+  2. `telegram_bot.send_photo` с `url: http://192.168.100.19:2323/?cmd=getScreenshot&password=admin` (без `authentication: digest`), `message_thread_id: 20`, inline-кнопками `/aco_open_door` и `/aco_open_gate`, `continue_on_error: true` и `response_variable: tg_photo_res`.
+  3. Если `tg_photo_res` не удался (`tg_photo_res is not defined` или ошибка) — резервное текстовое уведомление `telegram_bot.send_message` с теми же кнопками в `message_thread_id: 20`, чтобы пользователь гарантированно получил вызов в Telegram.
+
+### Skeptic (Финальное ревью)
+Подтверждаю: ошибка `No camshot available` полностью устранена, `authentication: digest` убран, и даже при сбое захвата экрана Android уведомление с кнопками открытия двери/ворот всё равно дойдёт до Telegram. Консенсус достигнут за 2 итерации.
+
+### Заключение
+В `\\192.168.100.5\config\automations.yaml` (`acogo_doorbell_telegram_photo`) заменяем `camera.snapshot` (`camera.taba9`) на прямую отправку скриншота `url: http://192.168.100.19:2323/?cmd=getScreenshot&password=admin` с резервным текстовым сообщением при ошибке. Ожидается подтверждение пользователя.
+
+## [2026-11-17T09:40:22+01:00] Задача: есть же сенсор image.taba9_screenshot он каждые 20 сек или чаще обновляется
+
+### Контекст проверки `image.taba9_screenshot`
+- Проверка в HA: `image.taba9_screenshot` активен (`state: 2026-11-17T08:40:15.274793+00:00`), имеет `entity_picture: /api/image_proxy/image.taba9_screenshot?token=...` и отдаёт PNG (`HTTP 200`, `1320238` байт).
+
+### Archi
+Отличная идея! Вместо прямого URL с паролем `192.168.100.19:2323` используем штатную сущность HA `image.taba9_screenshot`:
+1. После `delay: seconds: 3` вызываем `homeassistant.update_entity` для `image.taba9_screenshot`, чтобы принудительно получить свежий скриншот именно окна `acoGO!`, не дожидаясь планового 20-30 сек цикла.
+2. Отправляем в `telegram_bot.send_photo`: `url: "http://127.0.0.1:8123{{ state_attr('image.taba9_screenshot', 'entity_picture') }}"`.
+
+### Skeptic
+3 замечания:
+1. **Пауза после `homeassistant.update_entity`:** `update_entity` асинхронно запрашивает скриншот у Fully Kiosk и обновляет кэш `image_proxy`; нужна короткая пауза (`delay: seconds: 1`) перед `send_photo`, чтобы в Telegram не ушёл предыдущий кадр.
+2. **Валидация `entity_picture`:** Если на старте HA `entity_picture` временно `None`, шаблон `http://127.0.0.1:8123None` даст ошибку — нужна проверка `state_attr('image.taba9_screenshot', 'entity_picture')` и fallback на текстовое уведомление с кнопками.
+3. **Нет секретов в `automations.yaml`:** Использование `127.0.0.1:8123` + `entity_picture` (с временным `access_token` HA) безопаснее, чем хардкод пароля киоска в `automations.yaml`.
+
+### Итерация 2: Доработка Archi
+Принимаю все 3 пункта Skeptic:
+- После `delay: seconds: 3` вызываем `homeassistant.update_entity` (`target: entity_id: image.taba9_screenshot`), затем `delay: seconds: 1`.
+- Если `state_attr('image.taba9_screenshot', 'entity_picture')` не пустой — отправляем `telegram_bot.send_photo` с `url: "http://127.0.0.1:8123{{ state_attr('image.taba9_screenshot', 'entity_picture') }}"` (`continue_on_error: true`, `response_variable: tg_photo_res`).
+- При отсутствии `entity_picture` или ошибке отправки — шлём резервное сообщение `telegram_bot.send_message` с кнопками `/aco_open_door` и `/aco_open_gate` в `message_thread_id: 20`.
+
+### Skeptic (Финальное ревью)
+Подтверждаю: без хардкода пароля, со свежим принудительным обновлением кадра и гарантированным резервным уведомлением. Консенсус достигнут за 2 итерации.
+
+### Заключение
+В `\\192.168.100.5\config\automations.yaml` (`acogo_doorbell_telegram_photo`) используем `homeassistant.update_entity` для `image.taba9_screenshot` + `telegram_bot.send_photo` через `http://127.0.0.1:8123{{ state_attr('image.taba9_screenshot', 'entity_picture') }}` с fallback-сообщением. Ожидается подтверждение пользователя.
