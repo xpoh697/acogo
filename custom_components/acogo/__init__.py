@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 import importlib.util
+import io
 import json
 import logging
 from pathlib import Path
@@ -51,6 +52,37 @@ PLATFORMS: list[Platform] = [
 ]
 
 ALLOWED_STATIC_FILES = {"acogo-webrtc-card.js"}
+
+
+def _capture_adb_screenshot_sync(host: str, key_path: str) -> bytes | None:
+    """Capture live tablet screen via ADB TCP (port 5555) using authorized RSA key."""
+    from adb_shell.adb_device import AdbDeviceTcp
+    from adb_shell.auth.sign_pythonrsa import PythonRSASigner
+
+    priv_file = Path(key_path)
+    pub_file = Path(f"{key_path}.pub")
+    if not priv_file.is_file() or not pub_file.is_file():
+        _LOGGER.debug("ADB key files not found at %s", key_path)
+        return None
+
+    priv = priv_file.read_text(encoding="utf-8")
+    pub = pub_file.read_text(encoding="utf-8")
+    signer = PythonRSASigner(pub, priv)
+    device = AdbDeviceTcp(host, 5555, default_transport_timeout_s=5.0)
+    try:
+        device.connect(rsa_keys=[signer], auth_timeout_s=3.0)
+        remote_tmp = "/data/local/tmp/acogo_call.png"
+        device.shell(f"screencap -p {remote_tmp}", read_timeout_s=5.0)
+        buf = io.BytesIO()
+        device.pull(remote_tmp, buf)
+        device.shell(f"rm -f {remote_tmp}", read_timeout_s=3.0)
+        data = buf.getvalue()
+        return data if len(data) > 10240 else None
+    finally:
+        try:
+            device.close()
+        except Exception:
+            pass
 
 
 class CardStaticView(HomeAssistantView):
@@ -453,7 +485,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Register custom service: capture_snapshot
     async def async_handle_capture_snapshot(call: ServiceCall) -> dict[str, Any]:
-        """Capture video snapshot, using cached AWS STS credentials if panel is busy in call."""
+        """Capture live call screenshot via ADB if ringing, else WebRTC snapshot."""
         runtime = _get_active_entry_runtime(hass)
         if not runtime:
             raise HomeAssistantError("acoGO integration is not ready")
@@ -476,9 +508,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         jpeg_bytes: bytes | None = None
         has_aiortc = importlib.util.find_spec("aiortc") is not None
+        has_adb = importlib.util.find_spec("adb_shell") is not None
         is_ringing = bool((active_coord.data or {}).get(device_id, {}).get("is_ringing", False))
 
-        if has_aiortc:
+        # During an active call, capture the tablet screen directly via ADB (shows live acoGO video)
+        if is_ringing and has_adb:
+            key_path = hass.config.path(".storage", "acogo_adbkey")
+            for k_entry in hass.config_entries.async_entries("fully_kiosk"):
+                host = k_entry.data.get("host")
+                if not host:
+                    continue
+                try:
+                    adb_bytes = await hass.async_add_executor_job(
+                        _capture_adb_screenshot_sync, host, key_path
+                    )
+                    if adb_bytes:
+                        jpeg_bytes = adb_bytes
+                        active_coord.last_valid_snapshot[device_id] = (time.time(), adb_bytes)
+                        _LOGGER.info("Captured live tablet call screenshot via ADB (%s, %d bytes)", host, len(adb_bytes))
+                        break
+                except Exception as adb_err:
+                    _LOGGER.warning("ADB screenshot failed for %s: %s", host, adb_err)
+
+        if not jpeg_bytes and has_aiortc:
             params = await active_coord.async_start_preview(
                 device_id, retry_count=1 if is_ringing else 3
             )
@@ -494,29 +546,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             if params and not is_ringing:
                 await active_coord.async_stop_preview(device_id)
 
-            # If panel is busy in active call, attach directly to live KVS channel using cached STS credentials
-            if not jpeg_bytes:
-                cached_aws_entry = active_coord.last_valid_aws.get(device_id)
-                if cached_aws_entry:
-                    aws_time, cached_aws = cached_aws_entry
-                    if time.time() - aws_time < 3000.0:
-                        _LOGGER.info(
-                            "Attempting live WebRTC snapshot via cached AWS credentials (age %ds)",
-                            int(time.time() - aws_time),
-                        )
-                        from .webrtc import async_capture_webrtc_snapshot
-                        jpeg_bytes = await async_capture_webrtc_snapshot(
-                            session, cached_aws, timeout=min(timeout, 8.0)
-                        )
-                        if jpeg_bytes:
-                            active_coord.last_valid_snapshot[device_id] = (time.time(), jpeg_bytes)
-
-        # Fallback 1: Use last captured valid real frame if fresh (TTL < 15 min = 900s)
+        # Fallback 1: Use cached real frame (max 60s during active call to avoid stale empty photos)
         if not jpeg_bytes:
             cached_entry = active_coord.last_valid_snapshot.get(device_id)
             if cached_entry:
                 cached_time, cached_bytes = cached_entry
-                if time.time() - cached_time < 900.0:
+                max_age = 60.0 if is_ringing else 900.0
+                if time.time() - cached_time < max_age:
                     _LOGGER.info("Using cached real camera snapshot from %s ago", int(time.time() - cached_time))
                     jpeg_bytes = cached_bytes
 

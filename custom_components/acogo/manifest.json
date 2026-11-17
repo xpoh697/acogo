@@ -10,7 +10,8 @@
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/xpoh697/acogo/issues",
   "requirements": [
-    "aiortc>=1.9.0"
+    "aiortc>=1.9.0",
+    "adb-shell>=0.4.4"
   ],
   "version": "1.2.0"
 }

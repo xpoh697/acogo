@@ -5024,3 +5024,73 @@ profit = today_house_consumption_cost + today_export_price - today_import_price
 1. **`custom_components/acogo/coordinator.py` и `__init__.py`**: кэшировать `last_valid_aws` при каждом фоновом/ручном получении `aws` и при занятости панели (`busy` во время звонка) подключаться к активному KVS-каналу через `last_valid_aws` для живого WebRTC-снимка с самой камеры домофона.
 2. **`custom_components/acogo/const.py` и `api.py`**: вернуть `DOOR_CALL_DELAY = 3.0`, `DOOR_HOLD_DELAY = 5.0` (по `"dialDelay": 3`) и логировать `ezOpen`/`f2Open`.
 3. **`\\192.168.100.5\config\automations.yaml`**: вернуть вызов `acogo.capture_snapshot` (`/config/www/cam/doorbell_acogo.jpg`, `timeout: 10`) в `acogo_doorbell_telegram_photo`.
+
+## [2026-11-17T10:07:31+01:00] Задача: делай 1й вариант (ADB по Wi-Fi для скриншота acoGO!)
+
+### Контекст диагностики
+- На `192.168.100.19` порт `5555` сейчас закрыт (`TcpTestSucceeded: False`), на сервере HA интеграции `androidtv` и `shell_command` не подключены, на текущем ПК `adb` и `adb_shell` не установлены.
+
+### Archi
+Для съёмки скриншота поверх `pl.aco.acogo` без root используем стандартный **ADB over Wi-Fi** (`screencap -p`):
+1. Пользователь на планшете включает *Отладку по Wi-Fi* в *Параметрах разработчика* (и при необходимости даёт код спаривания или переводит в `tcpip 5555`).
+2. В Home Assistant добавляем штатную интеграцию **Android Debug Bridge** (`androidtv` на `192.168.100.19:5555`) или делаем сервис снятия скриншота через `adb-shell` прямо в `acogo`, который пишет `/config/www/cam/doorbell_acogo.jpg` и отправляет в Telegram.
+
+### Skeptic
+3 замечания:
+1. **Порт Wireless Debugging на Android 16 динамический до `adb tcpip 5555`:** Встроенная на планшете «Отладка по Wi-Fi» при каждом переподключении Wi-Fi может менять случайный порт (например `37421`), если не выполнить `adb tcpip 5555` (через USB или после первичного `adb pair` + `adb connect`) — а после перезагрузки планшета Android снова сбрасывает `tcpip 5555`! Поэтому на стороне HA лучше либо один раз закрепить `5555` через `adb tcpip 5555`, либо учитывать смену порта.
+2. **Не менять код HA вслепую до подтверждения доступности ADB на планшете:** Сначала нужно, чтобы пользователь включил *Отладку по Wi-Fi* на `192.168.100.19` и мы убедились в успешном `screencap -p` по сети; только после этого вносить правки в интеграцию/автоматизацию.
+3. **Задержка на `screencap -p` и таймаут:** `screencap` через `adb_shell` на Wi-Fi занимает ~1–1.5 сек и должен выполняться с таймаутом 5 сек и fallback-уведомлением в Telegram при недоступности ADB.
+
+### Итерация 2: Доработка Archi
+Принимаю все 3 пункта Skeptic:
+- Первым шагом даём пользователю точную инструкцию по включению **Отладки по Wi-Fi** на Samsung Galaxy Tab A9 (`SM-X110`, Android 16).
+- После получения от пользователя порта/кода спаривания (или открытия порта `5555`) подключаемся/спариваемся с планшетом, проверяем реальный `screencap` поверх окна, и затем добавляем снятие скриншота в интеграцию/HA с таймаутом `5` сек и fallback.
+
+### Skeptic (Финальное ревью)
+Подтверждаю: сначала физическое включение и проверка ADB-соединения с планшетом, затем интеграция в HA. Консенсус достигнут за 2 итерации.
+
+### Заключение
+Код проекта пока не меняем. Выдаём пользователю чёткую инструкцию по включению **Отладки по Wi-Fi** на планшете `SM-X110` (`192.168.100.19`) и ждём порт/код спаривания (или открытый порт `5555`) для подключения и теста `screencap`.
+
+## [2026-11-17T10:15:41+01:00] Задача: Подключение ADB по Wi-Fi (192.168.100.19:5555) и снятие живого скриншота поверх acoGO! в Telegram
+
+### Контекст выполнения
+- Планшет `192.168.100.19` успешно спарен по Wireless Debugging (`adb pair 192.168.100.19:43717 885710`), переведён на порт `5555` (`tcpip 5555`), подключён (`192.168.100.19:5555 device`).
+- Проверено снятие системного скриншота поверх приложений (`screencap -p /data/local/tmp/adb_test.png` + `adb pull` → `123895` байт PNG с окном Настроек Android, `0.036s`), разрешение `GET_USAGE_STATS` выдано `de.ozerov.fully`, киоск возвращён на экран (`fg=de.ozerov.fully`).
+- Авторизованный RSA-ключ `%USERPROFILE%\.android\adbkey` (`Vitaly@NITROV16S`) уже доверен на планшете.
+
+### Archi
+Чтобы Home Assistant сам снимал живой скриншот экрана планшета в момент звонка (когда на экране открыто видео `acoGO!`):
+1. Скопировать доверенный ключ `adbkey` / `adbkey.pub` в `\\192.168.100.5\config\.storage\acogo_adbkey` (без всплывающих запросов подтверждения на планшете!).
+2. Добавить `"adb-shell>=0.4.4"` в `custom_components/acogo/manifest.json` (`requirements`).
+3. В `custom_components/acogo/__init__.py` (`async_handle_capture_snapshot`): если `is_ringing` — сначала делать живой ADB-снимок планшета (`AdbDeviceTcp(host, 5555)` + `PythonRSASigner` → `screencap -p /data/local/tmp/acogo_call.png` → `pull` → сохранить в `/config/www/cam/doorbell_acogo.jpg` и удалить временный файл на планшете).
+4. В `automations.yaml` (`acogo_doorbell_telegram_photo`) поставить `delay: seconds: 3` перед `acogo.capture_snapshot`, чтобы видеопоток `acoGO!` успел открыться на экране планшета.
+
+### Skeptic
+3 критических замечания:
+1. **Не блокировать event loop HA синхронным `adb-shell`:** `adb_shell.adb_device.AdbDeviceTcp` — синхронная (блокирующая) библиотека! Вызывать её напрямую в `async`-функции нельзя — обязательно запускать через `await hass.async_add_executor_job(...)` с жёстким таймаутом `auth_timeout_s=3.0` и `read_timeout_s=5.0`, и закрывать соединение в `finally`.
+2. **Убрать старый 15-минутный кэш при провале во время звонка или четко разделять fallback:** Если ADB временно недоступен (например, после перезагрузки планшета сбросился `tcpip 5555`), не нужно подсовывать 15-минутный старый пустой кадр — если при `is_ringing` живой ADB-снимок не получился и свежий (< 60 сек) WebRTC-кадр тоже недоступен, лучше отправить текстовое сообщение с кнопками (или `generate_snapshot_fallback_card`), чем обманывать пользователя старым пустым двором.
+3. **Утечка временных файлов на планшете и формат изображения:** Удалять `/data/local/tmp/acogo_call.png` на планшете сразу после `pull` (в `shell`), а на сервере HA сохранять PNG/JPEG байты корректно (Telegram `send_photo` принимает PNG напрямую, даже если расширение `.jpg` или `.png`, но аккуратнее писать `.png` или конвертировать при наличии `PIL` — `Pillow` в HA всегда есть, но `.png` / `send_photo` работает и так).
+
+### Итерация 2: Доработка Archi
+Принимаю все 3 пункта Skeptic:
+1. В `custom_components/acogo/webrtc.py` (или отдельную вспомогательную функцию `_capture_adb_screenshot_sync(host, key_path)`) выносим синхронную функцию для `hass.async_add_executor_job`:
+   - `PythonRSASigner(pub, priv)` из `/config/.storage/acogo_adbkey(.pub)`.
+   - `device = AdbDeviceTcp(host, 5555, default_transport_timeout_s=5.0)` → `device.connect(rsa_keys=[signer], auth_timeout_s=3.0)`.
+   - `device.shell("screencap -p /data/local/tmp/acogo_call.png")` → `device.pull("/data/local/tmp/acogo_call.png", local_tmp)` (в `BytesIO`!) → `device.shell("rm -f /data/local/tmp/acogo_call.png")` → `device.close()` в `finally`.
+2. В `__init__.py` (`async_handle_capture_snapshot`):
+   - При `is_ringing == True`: сначала пробуем ADB-скриншот с хоста из `hass.config_entries.async_entries("fully_kiosk")`!
+   - Если `is_ringing == False` (или ADB не ответил): пробуем WebRTC `async_start_preview` / `async_capture_webrtc_snapshot`.
+   - При `is_ringing == True` ограничиваем кэш-fallback до `60` сек (вместо `900` сек), чтобы больше никогда не слать 6-минутные пустые кадры!
+3. В `automations.yaml` (`acogo_doorbell_telegram_photo`):
+   - `switch.turn_on` (`switch.taba9_screen`) → `delay: seconds: 3` (чтобы `acoGO!` прогрузил видео звонящего) → `acogo.capture_snapshot` (`/config/www/cam/doorbell_acogo.jpg`) → `telegram_bot.send_photo` в `message_thread_id: 20` с кнопками `/aco_open_door` и `/aco_open_gate`.
+
+### Skeptic (Финальное ревью)
+Подтверждаю: блокировки event loop нет (`async_add_executor_job`), `adbkey` переиспользуется без новых запросов на планшете, временный файл на планшете удаляется, 15-минутный обманчивый кэш при звонке ограничен до 60 сек. Консенсус достигнут за 2 итерации.
+
+### Заключение
+План готов к применению (ожидает одобрения пользователя):
+1. Скопировать `%USERPROFILE%\.android\adbkey` и `.pub` в `\\192.168.100.5\config\.storage\acogo_adbkey(.pub)`.
+2. Добавить `"adb-shell>=0.4.4"` в `custom_components/acogo/manifest.json`.
+3. Добавить `capture_adb_screenshot_sync` (через `BytesIO` + `hass.async_add_executor_job`) и использовать его в `async_handle_capture_snapshot` (`custom_components/acogo/__init__.py`) при `is_ringing == True`.
+4. Обновить `acogo_doorbell_telegram_photo` в `\\192.168.100.5\config\automations.yaml` (добавить `delay: seconds: 3` перед `acogo.capture_snapshot`).
