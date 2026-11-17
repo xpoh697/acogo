@@ -225,6 +225,7 @@ class AcoGoApiClient:
                 state = await self.check_state(target_id)
                 is_active_call = (state == "busy")
 
+            _LOGGER.info("Executing %s for %s (is_active_call=%s)", order_cmd, target_id, is_active_call)
             if is_active_call:
                 return await self.send_order(target_id, order_cmd)
 

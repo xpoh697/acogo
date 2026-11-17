@@ -403,6 +403,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         aws = params.get("aws", {})
         if not aws or not aws.get("channel arn"):
             raise HomeAssistantError("Failed to obtain valid AWS streaming credentials from acoGO Cloud")
+        if aws.get("access key ID"):
+            active_coord.last_valid_aws[device_id] = (time.time(), aws)
 
         client_id = f"HABrowser_{uuid.uuid4().hex[:8]}"
         wss_url = generate_signed_wss_url(aws, client_id)
@@ -451,7 +453,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Register custom service: capture_snapshot
     async def async_handle_capture_snapshot(call: ServiceCall) -> dict[str, Any]:
-        """Capture video snapshot with fallback to last real camera image if live stream busy."""
+        """Capture video snapshot, using cached AWS STS credentials if panel is busy in call."""
         runtime = _get_active_entry_runtime(hass)
         if not runtime:
             raise HomeAssistantError("acoGO integration is not ready")
@@ -474,20 +476,40 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         jpeg_bytes: bytes | None = None
         has_aiortc = importlib.util.find_spec("aiortc") is not None
+        is_ringing = bool((active_coord.data or {}).get(device_id, {}).get("is_ringing", False))
 
         if has_aiortc:
-            params = await active_coord.async_start_preview(device_id, retry_count=3)
+            params = await active_coord.async_start_preview(
+                device_id, retry_count=1 if is_ringing else 3
+            )
             aws = params.get("aws") if isinstance(params, dict) else None
 
             if isinstance(aws, dict) and aws.get("access key ID") and aws.get("channel arn"):
+                active_coord.last_valid_aws[device_id] = (time.time(), aws)
                 from .webrtc import async_capture_webrtc_snapshot
                 jpeg_bytes = await async_capture_webrtc_snapshot(session, aws, timeout=timeout)
                 if jpeg_bytes:
                     active_coord.last_valid_snapshot[device_id] = (time.time(), jpeg_bytes)
 
-            is_ringing = (active_coord.data or {}).get(device_id, {}).get("is_ringing", False)
-            if not is_ringing:
+            if params and not is_ringing:
                 await active_coord.async_stop_preview(device_id)
+
+            # If panel is busy in active call, attach directly to live KVS channel using cached STS credentials
+            if not jpeg_bytes:
+                cached_aws_entry = active_coord.last_valid_aws.get(device_id)
+                if cached_aws_entry:
+                    aws_time, cached_aws = cached_aws_entry
+                    if time.time() - aws_time < 3000.0:
+                        _LOGGER.info(
+                            "Attempting live WebRTC snapshot via cached AWS credentials (age %ds)",
+                            int(time.time() - aws_time),
+                        )
+                        from .webrtc import async_capture_webrtc_snapshot
+                        jpeg_bytes = await async_capture_webrtc_snapshot(
+                            session, cached_aws, timeout=min(timeout, 8.0)
+                        )
+                        if jpeg_bytes:
+                            active_coord.last_valid_snapshot[device_id] = (time.time(), jpeg_bytes)
 
         # Fallback 1: Use last captured valid real frame if fresh (TTL < 15 min = 900s)
         if not jpeg_bytes:
@@ -539,6 +561,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     p = await coordinator.async_start_preview(dev_id, retry_count=1)
                     aws_p = p.get("aws")
                     if isinstance(aws_p, dict) and aws_p.get("access key ID") and aws_p.get("channel arn"):
+                        coordinator.last_valid_aws[dev_id] = (time.time(), aws_p)
                         from .webrtc import async_capture_webrtc_snapshot
                         frame = await async_capture_webrtc_snapshot(session, aws_p, timeout=12.0)
                         if frame:

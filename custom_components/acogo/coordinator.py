@@ -50,6 +50,8 @@ class AcoGoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._kiosk_ready_streak: dict[str, int] = {}
         # Cache for last valid real camera frame (device_id -> (timestamp, jpeg_bytes))
         self.last_valid_snapshot: dict[str, tuple[float, bytes]] = {}
+        # Cache for last valid AWS KVS credentials (device_id -> (timestamp, aws_dict))
+        self.last_valid_aws: dict[str, tuple[float, dict[str, Any]]] = {}
 
     def start_kiosk_monitor(self) -> None:
         """Start fast local LAN polling of Fully Kiosk instances configured in HA."""

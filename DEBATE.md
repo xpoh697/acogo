@@ -4942,3 +4942,85 @@ profit = today_house_consumption_cost + today_export_price - today_import_price
 
 ### Заключение
 В `\\192.168.100.5\config\automations.yaml` (`acogo_doorbell_telegram_photo`) используем `homeassistant.update_entity` для `image.taba9_screenshot` + `telegram_bot.send_photo` через `http://127.0.0.1:8123{{ state_attr('image.taba9_screenshot', 'entity_picture') }}` с fallback-сообщением. Ожидается подтверждение пользователя.
+
+## [2026-11-17T09:46:06+01:00] Задача: Не так картинка, кнопка открыть калитку сработала, а открыть ворота - нет
+
+### Контекст диагностики (`acogo.log`, `device-by-app`, история HA и скриншот)
+1. **Скриншот из Telegram (`09:44`):** `image.taba9_screenshot` снял дашборд Home Assistant (под приложением `acoGO!`), так как на Android 16 `getScreenshot` в Fully Kiosk без root/MediaProjection захватывает только свой собственный WebView, но не окно стороннего приложения `pl.aco.acogo` поверх него.
+2. **Тайминг кнопок (`09:44:17` и `09:44:23`):**
+   - В `09:44:17` нажатие `open_door` (`ezOpen`) прошло по активному вызову (`busy`) и открыло калитку, завершив входящий вызов на панели.
+   - В `09:44:23` нажатие `open_gate` (`f2Open`) пошло уже без активного вызова через `receiveCall` → `DOOR_CALL_DELAY = 1.0s` → `f2Open` → `DOOR_HOLD_DELAY = 2.0s` → `endCall` (`406`).
+   - Проверка `GET /device-by-app` для панели `01:01:39:b1` показала параметр **`"dialDelay": 3`** (3 секунды). Задержка `1.0s` оказалась меньше `dialDelay: 3`, из-за чего `f2Open` не сработал без поднятой трубки!
+
+### Archi
+Предлагаю два чётких исправления:
+1. **Надёжное открытие ворот и двери без трубки (`const.py` и `api.py`):**
+   - Вернуть `DOOR_CALL_DELAY = 3.0` (строго соответствует `"dialDelay": 3` самой панели `01:01:39:b1`) и `DOOR_HOLD_DELAY = 4.0`.
+   - При активном вызове (`busy`) `ezOpen`/`f2Open` по-прежнему будут срабатывать мгновенно (< 0.5 сек), а в режиме ожидания (`ready`) — гарантированно после `dialDelay: 3s`.
+2. **Уведомление в Telegram (`automations.yaml`):**
+   - Убрать вводящий в заблуждение скриншот дашборда `image.taba9_screenshot` (раз Android 16 не даёт снять окно `acoGO!`).
+   - Отправлять чистое уведомление `telegram_bot.send_message` с кнопками `🚪 Открыть дверь` и `🚗 Открыть ворота` (либо с фото с другой выбранной пользователем камеры, если какая-то видит улицу/подход к воротам).
+
+### Skeptic
+3 замечания:
+1. **Не занижать `DOOR_CALL_DELAY` ниже `dialDelay` панели (`3` сек):** Попытка сэкономить 2 секунды на `receiveCall` уже привела к несрабатыванию ворот. В `const.py` должно быть `DOOR_CALL_DELAY = 3.0` и `DOOR_HOLD_DELAY = 5.0` (как в `technical_specification.md`, раздел 2.3.3).
+2. **Последовательное нажатие «дверь» → «ворота»:** Когда пользователь в Telegram сначала открыл калитку (`ezOpen`), панель завершила звонок, а следующее нажатие (`open_gate`) попало в состояние `ready` и требовало `receiveCall + 3s`. Это нормальное поведение панели, но оба шага должны быть залогированы в `acogo.log` на уровне `INFO` (какой `order_cmd` и с каким `is_active_call` отправлен), чтобы больше не гадать по логам.
+3. **Честность по фото с домофона:** Пока планшет принимает звонок через родное приложение `acoGO!`, ни HA, ни Fully Kiosk не могут вытянуть живой кадр с домофона в момент звонка (канал панели занят `busy`, а Android 16 изолирует окна). Пользователю нужно выбрать: либо чистое текстовое сообщение с кнопками, либо фото с одной из уличных камер (`camera.wejscie_2`, `camera.ogrod`, `camera.garaz`).
+
+### Итерация 2: Доработка Archi
+Принимаю все 3 пункта Skeptic:
+- В `const.py` возвращаем `DOOR_CALL_DELAY = 3.0` и `DOOR_HOLD_DELAY = 5.0`.
+- В `api.py` (`open_door_sequence`) добавляем информативный `DEBUG`/`INFO` лог отправляемой команды (`order_cmd`, `is_active_call`), чтобы в `acogo.log` было видно каждое нажатие `ezOpen` и `f2Open`.
+- В `automations.yaml` (`acogo_doorbell_telegram_photo`) убираем `image.taba9_screenshot` (чтобы не слать картинку дашборда) и оставляем мгновенное уведомление `telegram_bot.send_message` с кнопками `/aco_open_door` и `/aco_open_gate` (если пользователь захочет прикрепить конкретную уличную камеру — легко добавим).
+
+### Skeptic (Финальное ревью)
+Подтверждаю: `dialDelay: 3` учтён полностью, `ezOpen`/`f2Open` логируются, фейковый скриншот дашборда убран. Консенсус достигнут за 2 итерации.
+
+### Заключение
+Утверждён план изменений (ожидает подтверждения пользователя):
+1. **`custom_components/acogo/const.py` и `api.py`**: вернуть `DOOR_CALL_DELAY = 3.0`, `DOOR_HOLD_DELAY = 5.0` (по `"dialDelay": 3` панели) и добавить логирование в `open_door_sequence`.
+2. **`\\192.168.100.5\config\automations.yaml` (`acogo_doorbell_telegram_photo`)**: убрать скриншот `image.taba9_screenshot` (Android 16 не даёт снять окно `acoGO!`) и отправлять мгновенное сообщение `telegram_bot.send_message` с кнопками `/aco_open_door` и `/aco_open_gate`.
+
+## [2026-11-17T09:50:01+01:00] Задача: Блять мне изображение с камеры надо домофона что бы я видел кто там пришел! Нахер мне кнопки открыть если я хрен знаю кто там пришел?
+
+### Контекст исследования (`preview/request` и `acogo.log`)
+- Тест `POST /preview/request` показал, что `aws` содержит долгоживущий STS-токен (`session token len: 812`) и постоянный KVS-канал `arn:aws:kinesisvideo:eu-west-2:375409846789:channel/room-21/1770060649358` (`wss://v-fe304e5e.kinesisvideo.eu-west-2.amazonaws.com`).
+- Во время реального входящего звонка `POST /preview/request` возвращает `{"response": "busy"}` (без `aws`), поэтому `acogo.capture_snapshot` не запускал WebRTC и отдавал 5-минутный кэш `last_valid_snapshot` с пустой калиткой.
+- При этом во время звонка сама вызывная панель **уже активна** в этом самом KVS-канале (`room-21`), чтобы транслировать видео на планшет и телефоны.
+
+### Archi
+Гениальный обход блокировки `"busy"` во время звонка:
+1. **Кэширование `last_valid_aws` в `coordinator.py` и `__init__.py`:**
+   - При каждом успешном получении `aws` (в фоновом обновлении каждые 10 мин, в `start_webrtc_stream` и `capture_snapshot`) сохраняем `coordinator.last_valid_aws[device_id] = (time.time(), aws)`.
+   - В `capture_snapshot`: если `async_start_preview(device_id, retry_count=1)` вернул `{}` (`busy`), достаём `last_valid_aws[device_id]` (TTL до 50 мин) и вызываем `async_capture_webrtc_snapshot(session, cached_aws, timeout=10.0)` напрямую к активному KVS-каналу!
+2. **В `automations.yaml` (`acogo_doorbell_telegram_photo`):**
+   - Возвращаем вызов `acogo.capture_snapshot` (`/config/www/cam/doorbell_acogo.jpg`) + `telegram_bot.send_photo` в `message_thread_id: 20` с кнопками `/aco_open_door` и `/aco_open_gate`.
+3. **Надёжность кнопок открытия (`const.py`, `api.py`):**
+   - Возвращаем `DOOR_CALL_DELAY = 3.0` и `DOOR_HOLD_DELAY = 5.0` по `"dialDelay": 3` панели `01:01:39:b1`, чтобы `open_gate` (`f2Open`) и `open_door` (`ezOpen`) работали при любом состоянии трубки.
+
+### Skeptic
+3 критических замечания:
+1. **Не задерживать уведомление в Telegram на `retry_count=3` (~3 сек впустую) и на длинный WebRTC-таймаут:** Когда идёт реальный звонок, `preview/request` гарантированно вернёт `busy` с первой попытки — незачем делать `retry_count=3` (ждать 3 сек!). В `capture_snapshot`, если `is_ringing` уже `True` или `retry_count=1` вернул `busy`, нужно **мгновенно** переходить к `last_valid_aws`!
+2. **Совместимость `last_valid_aws` и возможный сбой STS-токена или занятость единственного слота:**
+   - Если фоновый рефрешер в `__init__.py` обновляет `last_valid_aws` каждые 10 минут, то токен всегда свежий (≤ 10 мин). Но если панель всё же не ответит на второй `SDP_OFFER` во время звонка (таймаут 8 сек), нужно не задерживать Telegram на 20 сек — ограничить таймаут WebRTC при звонке до `8.0` сек, и если живой кадр не пришёл, отдать `last_valid_snapshot` или статусную карточку, **а не падать**.
+   - Также при успешном фоновом рефреше каждые 10 минут НЕ закрывать/не портить локальный `last_valid_aws`, а просто обновлять его свежим `aws`.
+3. **Не забыть про `py_compile` и сохранение `DOOR_CALL_DELAY = 3.0`:** При тестировании кнопок после звонка `open_door` (`ezOpen`) и `open_gate` (`f2Open`) должны быть залогированы в `acogo.log` на уровне `INFO`.
+
+### Итерация 2: Доработка Archi
+Принимаю все 3 пункта Skeptic:
+1. В `coordinator.py`: добавляем `self.last_valid_aws: dict[str, tuple[float, dict[str, Any]]] = {}`.
+2. В `__init__.py` (`async_handle_capture_snapshot`, `_async_background_snapshot_refresh`, `async_handle_start_stream`):
+   - Везде при получении валидного `aws` сохраняем `active_coord.last_valid_aws[device_id] = (time.time(), aws)`.
+   - В `async_handle_capture_snapshot`: если `is_ringing` — сразу `retry_count=1` (без 3-секундной паузы); если `preview/request` не дал `aws` (`busy`), проверяем `last_valid_aws.get(device_id)` (моложе `3000` сек) и запускаем `async_capture_webrtc_snapshot(session, cached_aws, timeout=min(timeout, 8.0))` напрямую к уже открытому KVS-каналу звонка!
+   - Убеждаемся, что `async_stop_preview` вызывается только если реально стартовали новое превью (`params` не пустой).
+3. В `const.py` и `api.py`: возвращаем `DOOR_CALL_DELAY = 3.0`, `DOOR_HOLD_DELAY = 5.0` и логируем `order_cmd` + `is_active_call` на уровне `INFO`.
+4. В `automations.yaml` (`acogo_doorbell_telegram_photo`): вызываем `acogo.capture_snapshot` (`timeout: 10`) и отправляем `/config/www/cam/doorbell_acogo.jpg` в `message_thread_id: 20` с кнопками `/aco_open_door` и `/aco_open_gate`.
+
+### Skeptic (Финальное ревью)
+Подтверждаю: если KVS Master панели принимает дополнительный Viewer с кэшированным STS-токеном во время звонка, HA снимет реальный живой кадр звонящего с камеры самого домофона за 1–2 секунды без прерывания звонка на планшете. Задержки и fallback защищены, `dialDelay: 3` восстановлен. Консенсус достигнут за 2 итерации.
+
+### Заключение
+Утверждён план (ожидает одобрения пользователя):
+1. **`custom_components/acogo/coordinator.py` и `__init__.py`**: кэшировать `last_valid_aws` при каждом фоновом/ручном получении `aws` и при занятости панели (`busy` во время звонка) подключаться к активному KVS-каналу через `last_valid_aws` для живого WebRTC-снимка с самой камеры домофона.
+2. **`custom_components/acogo/const.py` и `api.py`**: вернуть `DOOR_CALL_DELAY = 3.0`, `DOOR_HOLD_DELAY = 5.0` (по `"dialDelay": 3`) и логировать `ezOpen`/`f2Open`.
+3. **`\\192.168.100.5\config\automations.yaml`**: вернуть вызов `acogo.capture_snapshot` (`/config/www/cam/doorbell_acogo.jpg`, `timeout: 10`) в `acogo_doorbell_telegram_photo`.
